@@ -8,6 +8,19 @@
 
 namespace mssql_connection {
 
+class MssqlConnectionPlugin : public flutter::Plugin {
+ public:
+  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows *registrar);
+
+  MssqlConnectionPlugin();
+
+  virtual ~MssqlConnectionPlugin();
+
+  // Disallow copy and assign.
+  MssqlConnectionPlugin(const MssqlConnectionPlugin&) = delete;
+  MssqlConnectionPlugin& operator=(const MssqlConnectionPlugin&) = delete;
+};
+
 // static
 void MssqlConnectionPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows *registrar) {
@@ -19,7 +32,7 @@ void MssqlConnectionPlugin::RegisterWithRegistrar(
   auto plugin = std::make_unique<MssqlConnectionPlugin>();
 
   channel->SetMethodCallHandler(
-      [plugin_pointer = plugin.get()](const auto &call, auto result) {
+      [](const auto &call, auto result) {
         result->NotImplemented();
       });
 
@@ -31,3 +44,10 @@ MssqlConnectionPlugin::MssqlConnectionPlugin() {}
 MssqlConnectionPlugin::~MssqlConnectionPlugin() {}
 
 }  // namespace mssql_connection
+
+void MssqlConnectionPluginRegisterWithRegistrar(
+    FlutterDesktopPluginRegistrarRef registrar) {
+  mssql_connection::MssqlConnectionPlugin::RegisterWithRegistrar(
+      flutter::PluginRegistrarManager::GetInstance()
+          ->GetRegistrar<flutter::PluginRegistrarWindows>(registrar));
+}

@@ -18,13 +18,19 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   flutter_wrapper_plugin
 )
 
-# Copy the FreeTDS and OpenSSL DLLs to the output directory of the executable
-add_custom_command(
-  TARGET ${PROJECT_NAME} POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+# Bundle the FreeTDS and OpenSSL DLLs with the plugin for Flutter Windows build system
+set(mssql_connection_bundled_libraries
   "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/sybdb.dll"
   "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/ct.dll"
   "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/libcrypto-1_1-x64.dll"
   "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/libssl-1_1-x64.dll"
-  "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+  PARENT_SCOPE
+)
+
+set(mssql_connection_plugin_bundled_libraries
+  "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/sybdb.dll"
+  "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/ct.dll"
+  "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/libcrypto-1_1-x64.dll"
+  "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/bin/libssl-1_1-x64.dll"
+  PARENT_SCOPE
 )

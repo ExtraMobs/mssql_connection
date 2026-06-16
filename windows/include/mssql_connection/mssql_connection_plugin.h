@@ -9,21 +9,15 @@
 #define FLUTTER_PLUGIN_EXPORT __declspec(dllimport)
 #endif
 
-namespace mssql_connection {
+#if defined(__cplusplus)
+extern "C" {
+#endif
 
-class MssqlConnectionPlugin : public flutter::Plugin {
- public:
-  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows *registrar);
+FLUTTER_PLUGIN_EXPORT void MssqlConnectionPluginRegisterWithRegistrar(
+    FlutterDesktopPluginRegistrarRef registrar);
 
-  MssqlConnectionPlugin();
-
-  virtual ~MssqlConnectionPlugin();
-
-  // Disallow copy and assign.
-  MssqlConnectionPlugin(const MssqlConnectionPlugin&) = delete;
-  MssqlConnectionPlugin& operator=(const MssqlConnectionPlugin&) = delete;
-};
-
-}  // namespace mssql_connection
+#if defined(__cplusplus)
+}
+#endif
 
 #endif  // FLUTTER_PLUGIN_MSSQL_CONNECTION_PLUGIN_H_
