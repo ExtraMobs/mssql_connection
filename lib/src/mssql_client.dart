@@ -10,6 +10,7 @@ import 'package:ffi/ffi.dart';
 import 'ffi/freetds_bindings.dart';
 import 'native_logger.dart';
 import 'sql_exception.dart';
+import 'sql_response.dart';
 
 class MssqlClient {
   final String server;
@@ -98,6 +99,7 @@ class MssqlClient {
         return false;
       }
 
+
       final u = username.toNativeUtf8();
       final p = password.toNativeUtf8();
       try {
@@ -174,7 +176,7 @@ class MssqlClient {
     } catch (e, st) {
       MssqlLogger.e('connect | exception=$e');
       MssqlLogger.w('connect | stacktrace=\n$st');
-      return false;
+      rethrow;
     }
   }
 
@@ -267,8 +269,7 @@ class MssqlClient {
         }
         final res = await executeParams(sql, pm);
         try {
-          final j = jsonDecode(res);
-          final affected = (j['affected'] is int) ? j['affected'] as int : 0;
+          final affected = res.totalAffectedRows;
           if (affected > 0) total += 1;
         } catch (_) {
           // On parse error, assume failure for that row
@@ -374,10 +375,15 @@ class MssqlClient {
   /// { columns: [..], rows: [ {col:val,..}, ..], affected: (int), error?: (string) }
   ///
   /// Logging: emits lines in the form `execute | key=value | ...`.
-  Future<String> execute(String sql) async {
+  Future<SqlResponse> execute(String sql) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
+    
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
+
     // Detect if we should enable strict SET options for this statement
     final _SetPlan plan = _analyzeSetNeeds(sql);
     if (plan.needsSet) {
@@ -407,7 +413,7 @@ class MssqlClient {
       }
 
       // 2) Execute the original SQL in its own batch (ensuring CREATE VIEW is first)
-      final cmd = sql.toNativeUtf8();
+      final cmd = _toLatin1Native(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -431,7 +437,7 @@ class MssqlClient {
       }
     } else {
       // Regular path
-      final cmd = sql.toNativeUtf8();
+      final cmd = _toLatin1Native(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -471,10 +477,14 @@ class MssqlClient {
   /// leverages the server to plan/execute with true parameters.
   ///
   /// Logging: emits lines in the form `executeParams | key=value | ...`.
-  Future<String> executeParams(String sql, Map<String, dynamic> params) async {
+  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
+
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
 
     // Normalize param names to include '@'
     final norm = <String, dynamic>{};
@@ -520,10 +530,7 @@ class MssqlClient {
         0,
         stmtBuf.type,
         -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (stmtBuf.type == SYBNVARCHAR)
-            ? (stmtBuf.buf.length >> 1)
-            : stmtBuf.buf.length,
+        stmtBuf.buf.length, // datalen: raw byte count
         stmtBuf.buf.ptr,
       );
       malloc.free(nameStmt);
@@ -549,10 +556,7 @@ class MssqlClient {
         0,
         paramsBuf.type,
         -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (paramsBuf.type == SYBNVARCHAR)
-            ? (paramsBuf.buf.length >> 1)
-            : paramsBuf.buf.length,
+        paramsBuf.buf.length, // datalen: raw byte count
         paramsBuf.buf.ptr,
       );
       malloc.free(nameParams);
@@ -582,11 +586,7 @@ class MssqlClient {
           0, // input param
           rpcVal.type,
           -1, // maxlen: -1 for non-OUTPUT
-          (rpcVal.type == SYBNVARCHAR)
-              ? (rpcVal.buf.length << 1)
-              : rpcVal
-                    .buf
-                    .length, // datalen: for NVARCHAR pass character count; for others, bytes
+          rpcVal.buf.length, // datalen: raw byte count
           rpcVal.buf.ptr,
         );
         malloc.free(cname);
@@ -633,6 +633,96 @@ class MssqlClient {
       malloc.free(rpcName);
     }
   }
+
+  /// Execute a stored procedure directly via DB-Lib RPC and return JSON.
+  ///
+  /// - [procName]: The name of the stored procedure.
+  /// - [params]: map of parameterName -> value.
+  ///
+  /// This uses direct RPC: dbrpcinit(dbproc, procName, 0) followed by dbrpcparam for each parameter.
+  Future<SqlResponse> executeProcedure(String procName, Map<String, dynamic> params) async {
+    _ensureConnected();
+    final db = _db!;
+    final dbproc = _dbproc!;
+
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
+
+    final norm = <String, dynamic>{};
+    params.forEach((k, v) => norm[_normalizeParamName(k)] = v);
+    MssqlLogger.i('executeProcedure | op=normalize | count=${norm.length}');
+
+    final rpcName = procName.toNativeUtf8();
+    final tempAllocations = <_TempBuf>[];
+
+    try {
+      MssqlLogger.i('executeProcedure | op=dbrpcinit | rpc=$procName');
+      final rcInit = db.dbrpcinit(dbproc, rpcName, 0);
+      if (rcInit != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbrpcinit | rc=$rcInit | error=fail');
+        try {
+          final empty = ''.toNativeUtf8();
+          db.dbrpcinit(dbproc, empty, DBRPCRESET);
+          malloc.free(empty);
+        } catch (_) {}
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbrpcinit failed for $procName');
+      }
+
+      for (final e in norm.entries) {
+        final name = e.key;
+        final value = e.value;
+        final rpcVal = _encodeForRpc(value);
+        tempAllocations.add(rpcVal.buf);
+        final cname = name.toNativeUtf8();
+        
+        final rcPi = db.dbrpcparam(
+          dbproc,
+          cname,
+          0, // input param
+          rpcVal.type,
+          -1, // maxlen
+          rpcVal.buf.length, // datalen: raw byte count
+          rpcVal.buf.ptr,
+        );
+        malloc.free(cname);
+        if (rcPi != SUCCEED) {
+          MssqlLogger.e('executeProcedure | op=dbrpcparam | name=$name | rc=$rcPi | error=fail');
+          try {
+            final z = ''.toNativeUtf8();
+            db.dbrpcinit(dbproc, z, DBRPCRESET);
+            malloc.free(z);
+          } catch (_) {}
+          final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+          throw SQLException(em ?? 'dbrpcparam failed for $name');
+        }
+      }
+
+      MssqlLogger.i('executeProcedure | op=dbrpcsend');
+      final rcSend = db.dbrpcsend(dbproc);
+      if (rcSend != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbrpcsend | rc=$rcSend | error=fail');
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbrpcsend failed');
+      }
+
+      MssqlLogger.i('executeProcedure | op=dbsqlok');
+      final rcOk = db.dbsqlok(dbproc);
+      if (rcOk != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbsqlok | rc=$rcOk | error=fail');
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbsqlok failed');
+      }
+
+      return _collectResults(db, dbproc);
+    } finally {
+      for (final t in tempAllocations) {
+        malloc.free(t.ptr);
+      }
+      malloc.free(rpcName);
+    }
+  }
   // --- Internals ---
 
   /// Collect rows and counts from the DB-Lib results pipeline.
@@ -648,11 +738,9 @@ class MssqlClient {
   /// Logging: emits standardized lines prefixed with `collectResults`.
   ///
   /// Returns JSON: { columns: [...], rows: [...], affected: (int), error?: (string) }
-  String _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
-    final rows = <Map<String, dynamic>>[];
-    final columns = <String>[];
+  SqlResponse _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
+    final resultSets = <SqlResultSet>[];
     int affectedTotal = 0;
-    bool capturedFirstSet = false;
     String? error;
 
     MssqlLogger.i('collectResults | op=start');
@@ -672,80 +760,58 @@ class MssqlClient {
       final ncols = db.dbnumcols(dbproc);
       MssqlLogger.i('collectResults | op=set | index=$setIndex | ncols=$ncols');
       final types = List<int>.filled(ncols, 0);
-      // Cache column names and types for efficiency
-      if (ncols > 0 && !capturedFirstSet) {
+      final columns = <String>[];
+      
+      if (ncols > 0) {
         for (var i = 1; i <= ncols; i++) {
           final cptr = db.dbcolname(dbproc, i);
           types[i - 1] = db.dbcoltype(dbproc, i);
           final name = cptr == nullptr ? 'col$i' : cptr.toDartString();
           columns.add(name);
         }
-        capturedFirstSet = true;
         MssqlLogger.i('collectResults | op=columns | count=${columns.length}');
       }
 
-      // Fetch rows only for the first schema-bearing result set
       int fetched = 0;
-      if (ncols > 0 && capturedFirstSet && columns.isNotEmpty) {
+      final rows = <List<dynamic>>[];
+      if (ncols > 0 && columns.isNotEmpty) {
         while (true) {
           final nr = db.dbnextrow(dbproc);
           if (nr == NO_MORE_ROWS) break;
           if (nr != REG_ROW && nr != MORE_ROWS) {
-            MssqlLogger.w(
-              'collectResults | op=dbnextrow | rc=$nr | warning=unexpected',
-            );
+            MssqlLogger.w('collectResults | op=dbnextrow | rc=$nr | warning=unexpected');
             break;
           }
-          final row = <String, dynamic>{};
+          final row = <dynamic>[];
           for (var i = 1; i <= ncols; i++) {
-            final name = i <= columns.length ? columns[i - 1] : 'col$i';
             final t = types[i - 1];
             final len = db.dbdatlen(dbproc, i);
             final ptr = db.dbdata(dbproc, i);
             final v = decodeDbValueWithFallback(db, dbproc, t, ptr, len);
-            row[name] = v;
+            row.add(v);
           }
           rows.add(row);
           fetched++;
         }
-        MssqlLogger.i(
-          'collectResults | op=rows | set=$setIndex | fetched=$fetched',
-        );
-      } else if (ncols > 0) {
-        // If this is a second schema-bearing set, skip its rows for shape stability
-        MssqlLogger.w(
-          'collectResults | op=skip-rows | set=$setIndex | reason=secondary-schema',
-        );
-        // Drain rows without collecting
-        while (true) {
-          final nr = db.dbnextrow(dbproc);
-          if (nr == NO_MORE_ROWS) break;
-          if (nr != REG_ROW && nr != MORE_ROWS) break;
-        }
+        MssqlLogger.i('collectResults | op=rows | set=$setIndex | fetched=$fetched');
+        resultSets.add(SqlResultSet(columns: columns, rows: rows));
       }
 
-      // Accumulate affected rows for this set
       try {
         final c = db.dbcount(dbproc);
         affectedTotal += c;
-        MssqlLogger.i(
-          'collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal',
-        );
+        MssqlLogger.i('collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal');
       } catch (e) {
         MssqlLogger.w('collectResults | op=dbcount | set=$setIndex | error=$e');
       }
     }
 
-    final result = <String, dynamic>{
-      'columns': columns,
-      'rows': rows,
-      'affected': affectedTotal,
-    };
-    if (error != null) result['error'] = error;
-    MssqlLogger.i(
-      'collectResults | status=done | rows=${rows.length} | affected=$affectedTotal',
+    MssqlLogger.i('collectResults | status=done | sets=${resultSets.length} | affected=$affectedTotal');
+    return SqlResponse(
+      resultSets: resultSets,
+      totalAffectedRows: affectedTotal,
+      error: error,
     );
-    return jsonEncode(result);
   }
 
   void _ensureConnected() {
@@ -769,9 +835,9 @@ class MssqlClient {
     }
     if (v is double) return 'float';
     if (v is String) return 'nvarchar(max)';
-    // Declare DateTime parameters as NVARCHAR and let SQL convert explicitly
-    // (e.g., CONVERT(datetime2, @when)). This avoids binary TDS packing.
-    if (v is DateTime) return 'nvarchar(50)';
+    // Declare DateTime parameters as VARCHAR(50) so it matches the SYBVARCHAR 
+    // encoding perfectly, allowing SQL Server to explicitly/implicitly convert it.
+    if (v is DateTime) return 'varchar(50)';
     if (v is Uint8List) return 'varbinary(max)';
     // Fallback to NVARCHAR
     return 'nvarchar(max)';
@@ -952,12 +1018,22 @@ _RpcVal _encodeForRpc(dynamic v) {
   return _RpcVal(sb.type, sb.buf);
 }
 
-// Format DateTime in an ISO-like pattern accepted by SQL Server, without 'Z'.
-// Example: 2025-08-28T02:34:56
+// Format DateTime into a string accepted by SQL Server for implicit varchar->datetime conversion.
+//
+// Contract:
+// - This function does NOT validate the DateTime value. Validation is the caller's responsibility.
+// - Dart's DateTime constructor normalizes out-of-range fields (e.g., month=99 overflows into
+//   extra years). The resulting normalized date is formatted and sent as-is.
+//   If the resulting value is outside SQL Server's supported DATETIME range
+//   (1753-01-01 to 9999-12-31), SQL Server will reject it and the driver will
+//   surface a SQLException with the server's error message. No silent truncation occurs.
+// - The format 'yyyy-MM-dd HH:mm:ss' (space separator, no fractional seconds) is used
+//   because it is unambiguously parsed by SQL Server regardless of DATEFORMAT/locale setting.
+//   The ISO8601 'T' separator is intentionally avoided — SQL Server rejects it in implicit
+//   varchar->datetime conversions under certain DATEFORMAT configurations.
 String _formatDateTimeForSql(DateTime dt) {
-  final d = dt.toUtc();
   String two(int n) => n < 10 ? '0$n' : '$n';
-  return '${d.year.toString().padLeft(4, '0')}-${two(d.month)}-${two(d.day)}T${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+  return '${dt.year.toString().padLeft(4, '0')}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
 }
 
 class _StringDbBuf {
@@ -968,28 +1044,36 @@ class _StringDbBuf {
 
 // Encode a Dart string as either UTF-8 (VARCHAR) if ASCII-only, or UTF-16LE (NVARCHAR) if it contains non-ASCII.
 _StringDbBuf _encodeStringSmart(String s) {
-  bool ascii = true;
-  final units = s.codeUnits;
-  for (final cu in units) {
-    if (cu > 0x7F) {
-      ascii = false;
-      break;
-    }
+  // Use Latin-1 (CP1252) for all strings. This prevents FreeTDS UTF-16LE conversion bugs
+  // and perfectly maps Portuguese characters (áéíóúç, and ´) without creating NUL squares.
+  final bytes = latin1.encode(s); // throws if contains characters > 0xFF. If we want fallback, we can do it manually.
+  // Actually, let's just use the manual replacement for safety:
+  final list = Uint8List(s.length);
+  for (int i = 0; i < s.length; i++) {
+    final cu = s.codeUnitAt(i);
+    list[i] = cu > 0xFF ? 63 : cu; // '?'
   }
-  if (ascii) {
-    final bytes = utf8.encode(s);
-    final p = malloc<Uint8>(bytes.length);
-    p.asTypedList(bytes.length).setAll(0, bytes);
-    return _StringDbBuf(SYBVARCHAR, _TempBuf(p, bytes.length));
+  final p = malloc<Uint8>(list.length);
+  p.asTypedList(list.length).setAll(0, list);
+  return _StringDbBuf(SYBVARCHAR, _TempBuf(p, list.length));
+}
+
+// Encode a Dart string as Latin-1 (CP1252) in a null-terminated native buffer.
+//
+// FreeTDS DB-Lib without client charset config passes bytes as-is to SQL Server.
+// SQL Server with Latin-based collations (SQL_Latin1_General_CP1_CI_AS) interprets
+// VARCHAR literals as CP1252 bytes. All Portuguese characters (ç, ã, á, etc.) are
+// in Latin-1 range (≤ U+00FF), so this conversion is lossless for PT-BR.
+// Characters above U+00FF are replaced with '?' (same as SQL Server behavior).
+//
+// ponytail: simple O(n) loop, no iconv, no extra deps
+Pointer<Utf8> _toLatin1Native(String s) {
+  final p = malloc<Uint8>(s.length + 1); // +1 null terminator
+  final view = p.asTypedList(s.length + 1);
+  for (int i = 0; i < s.length; i++) {
+    final c = s.codeUnitAt(i);
+    view[i] = c <= 0xFF ? c : 0x3F; // '?' for anything above Latin-1
   }
-  // UTF-16LE encode
-  final len = units.length * 2;
-  final p = malloc<Uint8>(len);
-  final view = p.asTypedList(len);
-  for (int i = 0, j = 0; i < units.length; i++, j += 2) {
-    final cu = units[i];
-    view[j] = cu & 0xFF;
-    view[j + 1] = (cu >> 8) & 0xFF;
-  }
-  return _StringDbBuf(SYBNVARCHAR, _TempBuf(p, len));
+  view[s.length] = 0; // null terminator
+  return p.cast<Utf8>();
 }

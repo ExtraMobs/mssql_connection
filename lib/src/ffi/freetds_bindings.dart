@@ -104,6 +104,7 @@ const int DBTEXTSIZE = 17; // set text size for large text retrieval
 // Per sybdb.h, DBSETUSER and DBSETPWD constants used with dbsetlname()
 const int DBSETUSER = 2;
 const int DBSETPWD = 3;
+const int DBSETCHARSET = 10;
 
 // RPC options (per sybdb.h)
 // DBRPCRECOMPILE causes the stored procedure to be recompiled before executing.
@@ -467,9 +468,11 @@ class DBLib {
     dbsetlname = _lib.lookupFunction<_dbsetlnameC, _dbsetlnameDart>(
       'dbsetlname',
     ); // Set LOGINREC field by selector
-    dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>(
-      'dbopen',
-    ); // Open DBPROCESS connection
+    try {
+      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('dbopen');
+    } catch (_) {
+      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('tdsdbopen');
+    }
     dbclose = _lib.lookupFunction<_dbcloseC, _dbcloseDart>(
       'dbclose',
     ); // Close DBPROCESS
@@ -602,6 +605,10 @@ class DBLib {
   /// - The underlying C function is `dbsetlname(LOGINREC*, const char*, int)`.
   int dbsetlpwd(Pointer<LOGINREC> login, Pointer<Utf8> password) =>
       dbsetlname(login, password, DBSETPWD);
+
+  /// Set the charset on a LOGINREC using the DBSETCHARSET selector.
+  int dbsetlcharset(Pointer<LOGINREC> login, Pointer<Utf8> charset) =>
+      dbsetlname(login, charset, DBSETCHARSET);
 
   static DBLib load() => DBLib(NativeLoader.loadDBLib());
 
@@ -820,6 +827,25 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
         final dt = base.add(Duration(days: days, minutes: minutes));
         return dt.toIso8601String();
       }
+    case SYBDATETIMN:
+      {
+        if (len == 8) {
+          final days = bd!.getInt32(0, Endian.little);
+          final time300 = bd.getInt32(4, Endian.little);
+          final base = DateTime(1900, 1, 1);
+          final date = base.add(Duration(days: days));
+          final micros = (time300 * 1000000) ~/ 300;
+          final dt = date.add(Duration(microseconds: micros));
+          return dt.toIso8601String();
+        } else if (len == 4) {
+          final days = bd!.getUint16(0, Endian.little);
+          final minutes = bd.getUint16(2, Endian.little);
+          final base = DateTime(1900, 1, 1);
+          final dt = base.add(Duration(days: days, minutes: minutes));
+          return dt.toIso8601String();
+        }
+        return null;
+      }
     case SYBBINARY:
     case SYBVARBINARY:
     case SYBIMAGE:
@@ -830,18 +856,16 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
     case SYBCHAR:
     case SYBVARCHAR:
     case SYBTEXT:
-      {
-        final bytes = ptr.asTypedList(len);
-        if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
-        return utf8.decode(bytes, allowMalformed: true);
-      }
     case SYBNTEXT:
     case SYBNVARCHAR:
       {
-        // NVARCHAR/NTEXT are UTF-16LE; dbdatlen returns the byte length.
-        // Decode exactly [len] bytes as UTF-16LE.
         final bytes = ptr.asTypedList(len);
-        return _utf16leDecode(bytes);
+        if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
+        try {
+          return utf8.decode(bytes, allowMalformed: false);
+        } catch (_) {
+          return latin1.decode(bytes, allowInvalid: true);
+        }
       }
     // For DECIMAL/NUMERIC/DATETIME, you may need proper conversion against TDS metadata.
     default:
@@ -885,8 +909,29 @@ dynamic decodeDbValueWithFallback(
     }
   }
   if (v is Uint8List) {
-    final s = tryConvertToString(db, dbproc, type, ptr, len);
-    if (s != null) return s;
+    String? s = tryConvertToString(db, dbproc, type, ptr, len);
+    if (s != null) {
+      // Fix FreeTDS legacy date formats (e.g. "Jan  1 1900  7:45:00:0000000AM")
+      if (type == SYBMSDATETIME2 || type == SYBMSDATE || type == SYBMSTIME || type == SYBMSDATETIMEOFFSET || type == SYBDATETIME || type == SYBDATETIME4 || type == SYBDATETIMN) {
+        final match = RegExp(r'^([A-Z][a-z]{2})\s+(\d+)\s+(\d{4})\s+(\d+):(\d{2})(?::(\d{2})(?::(\d+))?)?([AP]M)$', caseSensitive: false).firstMatch(s.trim());
+        if (match != null) {
+          final months = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12};
+          final mStr = match.group(1)!;
+          final m = months[mStr.substring(0, 1).toUpperCase() + mStr.substring(1).toLowerCase()] ?? 1;
+          final d = int.parse(match.group(2)!);
+          final y = int.parse(match.group(3)!);
+          int h = int.parse(match.group(4)!);
+          final min = int.parse(match.group(5)!);
+          final sec = match.group(6) != null ? int.parse(match.group(6)!) : 0;
+          // Fractional seconds not easily added to DateTime without losing precision or parsing, ignoring them.
+          final ampm = match.group(8)!.toUpperCase();
+          if (ampm == 'PM' && h < 12) h += 12;
+          if (ampm == 'AM' && h == 12) h = 0;
+          s = DateTime(y, m, d, h, min, sec).toIso8601String();
+        }
+      }
+      return s;
+    }
     // Last resort: base64 the raw bytes for JSON-safety
     return base64.encode(v);
   }
@@ -921,7 +966,11 @@ String? tryConvertToString(
     );
     if (outLen <= 0) return null;
     final bytes = dest.asTypedList(outLen);
-    return utf8.decode(bytes, allowMalformed: true);
+    try {
+      return utf8.decode(bytes, allowMalformed: false);
+    } catch (_) {
+      return latin1.decode(bytes, allowInvalid: true);
+    }
   } catch (_) {
     return null;
   } finally {

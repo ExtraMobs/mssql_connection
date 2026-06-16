@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:mssql_connection/mssql_connection.dart';
+import 'package:sql_server_wrapper/mssql_connection.dart';
 
 Future<int> main() async {
   // Provided credentials

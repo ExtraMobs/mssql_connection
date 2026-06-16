@@ -9,6 +9,12 @@ class NativeLoader {
   static DynamicLibrary loadDBLib() {
     NativeLogger.i('loadDBLib: platform=${Platform.operatingSystem}');
     if (Platform.isAndroid) {
+      NativeLogger.i('Android: opening libct.so first for dependencies');
+      try {
+        DynamicLibrary.open('libct.so');
+      } catch (e) {
+        NativeLogger.w('Android: failed to open libct.so: $e');
+      }
       NativeLogger.i('Android: opening libsybdb.so');
       return DynamicLibrary.open('libsybdb.so');
     } else if (Platform.isIOS) {

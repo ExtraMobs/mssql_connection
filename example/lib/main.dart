@@ -3,7 +3,7 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:mssql_connection/mssql_connection.dart';
+import 'package:sql_server_wrapper/mssql_connection.dart';
 
 void main() {
   runApp(const MyApp());

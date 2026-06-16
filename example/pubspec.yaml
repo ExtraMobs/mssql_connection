@@ -36,7 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   # Depend on the current package via a local path
-  mssql_connection:
+  sql_server_wrapper:
     path: ..
 
 dev_dependencies:
