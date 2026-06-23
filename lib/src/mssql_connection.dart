@@ -112,6 +112,14 @@ class MssqlConnection {
     return _client!.executeParams(query, params);
   }
 
+  Future<String> executeProcedure(
+    String procName,
+    Map<String, dynamic> params,
+  ) async {
+    await _ensureConnectedOrReconnect();
+    return _client!.executeProcedure(procName, params);
+  }
+
   Future<int> bulkInsert(
     String tableName,
     List<Map<String, dynamic>> rows, {

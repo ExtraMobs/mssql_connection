@@ -633,6 +633,94 @@ class MssqlClient {
       malloc.free(rpcName);
     }
   }
+
+  /// Execute a stored procedure directly via DB-Lib RPC and return JSON.
+  ///
+  /// - [procName]: The name of the stored procedure.
+  /// - [params]: map of parameterName -> value.
+  ///
+  /// This uses direct RPC: dbrpcinit(dbproc, procName, 0) followed by dbrpcparam for each parameter.
+  Future<String> executeProcedure(String procName, Map<String, dynamic> params) async {
+    _ensureConnected();
+    final db = _db!;
+    final dbproc = _dbproc!;
+
+    final norm = <String, dynamic>{};
+    params.forEach((k, v) => norm[_normalizeParamName(k)] = v);
+    MssqlLogger.i('executeProcedure | op=normalize | count=${norm.length}');
+
+    final rpcName = procName.toNativeUtf8();
+    final tempAllocations = <_TempBuf>[];
+
+    try {
+      MssqlLogger.i('executeProcedure | op=dbrpcinit | rpc=$procName');
+      final rcInit = db.dbrpcinit(dbproc, rpcName, 0);
+      if (rcInit != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbrpcinit | rc=$rcInit | error=fail');
+        try {
+          final empty = ''.toNativeUtf8();
+          db.dbrpcinit(dbproc, empty, DBRPCRESET);
+          malloc.free(empty);
+        } catch (_) {}
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbrpcinit failed for $procName');
+      }
+
+      for (final e in norm.entries) {
+        final name = e.key;
+        final value = e.value;
+        final rpcVal = _encodeForRpc(value);
+        tempAllocations.add(rpcVal.buf);
+        final cname = name.toNativeUtf8();
+        
+        final rcPi = db.dbrpcparam(
+          dbproc,
+          cname,
+          0, // input param
+          rpcVal.type,
+          -1, // maxlen
+          (rpcVal.type == SYBNVARCHAR)
+              ? (rpcVal.buf.length << 1)
+              : rpcVal.buf.length,
+          rpcVal.buf.ptr,
+        );
+        malloc.free(cname);
+        if (rcPi != SUCCEED) {
+          MssqlLogger.e('executeProcedure | op=dbrpcparam | name=$name | rc=$rcPi | error=fail');
+          try {
+            final z = ''.toNativeUtf8();
+            db.dbrpcinit(dbproc, z, DBRPCRESET);
+            malloc.free(z);
+          } catch (_) {}
+          final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+          throw SQLException(em ?? 'dbrpcparam failed for $name');
+        }
+      }
+
+      MssqlLogger.i('executeProcedure | op=dbrpcsend');
+      final rcSend = db.dbrpcsend(dbproc);
+      if (rcSend != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbrpcsend | rc=$rcSend | error=fail');
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbrpcsend failed');
+      }
+
+      MssqlLogger.i('executeProcedure | op=dbsqlok');
+      final rcOk = db.dbsqlok(dbproc);
+      if (rcOk != SUCCEED) {
+        MssqlLogger.e('executeProcedure | op=dbsqlok | rc=$rcOk | error=fail');
+        final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+        throw SQLException(em ?? 'dbsqlok failed');
+      }
+
+      return _collectResults(db, dbproc);
+    } finally {
+      for (final t in tempAllocations) {
+        malloc.free(t.ptr);
+      }
+      malloc.free(rpcName);
+    }
+  }
   // --- Internals ---
 
   /// Collect rows and counts from the DB-Lib results pipeline.
