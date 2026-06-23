@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'mssql_client.dart';
 import 'native_logger.dart';
+import 'sql_response.dart';
+export 'sql_response.dart';
 
 class MssqlConnection {
   static final MssqlConnection _instance = MssqlConnection._internal();
@@ -86,17 +88,17 @@ class MssqlConnection {
     }
   }
 
-  Future<String> getData(String query) async {
+  Future<SqlResponse> getData(String query) async {
     await _ensureConnectedOrReconnect();
     return _client!.execute(query);
   }
 
-  Future<String> writeData(String query) async {
+  Future<SqlResponse> writeData(String query) async {
     await _ensureConnectedOrReconnect();
     return _client!.execute(query);
   }
 
-  Future<String> getDataWithParams(
+  Future<SqlResponse> getDataWithParams(
     String query,
     Map<String, dynamic> params,
   ) async {
@@ -104,7 +106,7 @@ class MssqlConnection {
     return _client!.executeParams(query, params);
   }
 
-  Future<String> writeDataWithParams(
+  Future<SqlResponse> writeDataWithParams(
     String query,
     Map<String, dynamic> params,
   ) async {
@@ -112,7 +114,7 @@ class MssqlConnection {
     return _client!.executeParams(query, params);
   }
 
-  Future<String> executeProcedure(
+  Future<SqlResponse> executeProcedure(
     String procName,
     Map<String, dynamic> params,
   ) async {

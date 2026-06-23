@@ -10,6 +10,7 @@ import 'package:ffi/ffi.dart';
 import 'ffi/freetds_bindings.dart';
 import 'native_logger.dart';
 import 'sql_exception.dart';
+import 'sql_response.dart';
 
 class MssqlClient {
   final String server;
@@ -374,7 +375,7 @@ class MssqlClient {
   /// { columns: [..], rows: [ {col:val,..}, ..], affected: (int), error?: (string) }
   ///
   /// Logging: emits lines in the form `execute | key=value | ...`.
-  Future<String> execute(String sql) async {
+  Future<SqlResponse> execute(String sql) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
@@ -471,7 +472,7 @@ class MssqlClient {
   /// leverages the server to plan/execute with true parameters.
   ///
   /// Logging: emits lines in the form `executeParams | key=value | ...`.
-  Future<String> executeParams(String sql, Map<String, dynamic> params) async {
+  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
@@ -640,7 +641,7 @@ class MssqlClient {
   /// - [params]: map of parameterName -> value.
   ///
   /// This uses direct RPC: dbrpcinit(dbproc, procName, 0) followed by dbrpcparam for each parameter.
-  Future<String> executeProcedure(String procName, Map<String, dynamic> params) async {
+  Future<SqlResponse> executeProcedure(String procName, Map<String, dynamic> params) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
@@ -736,11 +737,9 @@ class MssqlClient {
   /// Logging: emits standardized lines prefixed with `collectResults`.
   ///
   /// Returns JSON: { columns: [...], rows: [...], affected: (int), error?: (string) }
-  String _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
-    final rows = <Map<String, dynamic>>[];
-    final columns = <String>[];
+  SqlResponse _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
+    final resultSets = <SqlResultSet>[];
     int affectedTotal = 0;
-    bool capturedFirstSet = false;
     String? error;
 
     MssqlLogger.i('collectResults | op=start');
@@ -760,80 +759,58 @@ class MssqlClient {
       final ncols = db.dbnumcols(dbproc);
       MssqlLogger.i('collectResults | op=set | index=$setIndex | ncols=$ncols');
       final types = List<int>.filled(ncols, 0);
-      // Cache column names and types for efficiency
-      if (ncols > 0 && !capturedFirstSet) {
+      final columns = <String>[];
+      
+      if (ncols > 0) {
         for (var i = 1; i <= ncols; i++) {
           final cptr = db.dbcolname(dbproc, i);
           types[i - 1] = db.dbcoltype(dbproc, i);
           final name = cptr == nullptr ? 'col$i' : cptr.toDartString();
           columns.add(name);
         }
-        capturedFirstSet = true;
         MssqlLogger.i('collectResults | op=columns | count=${columns.length}');
       }
 
-      // Fetch rows only for the first schema-bearing result set
       int fetched = 0;
-      if (ncols > 0 && capturedFirstSet && columns.isNotEmpty) {
+      final rows = <List<dynamic>>[];
+      if (ncols > 0 && columns.isNotEmpty) {
         while (true) {
           final nr = db.dbnextrow(dbproc);
           if (nr == NO_MORE_ROWS) break;
           if (nr != REG_ROW && nr != MORE_ROWS) {
-            MssqlLogger.w(
-              'collectResults | op=dbnextrow | rc=$nr | warning=unexpected',
-            );
+            MssqlLogger.w('collectResults | op=dbnextrow | rc=$nr | warning=unexpected');
             break;
           }
-          final row = <String, dynamic>{};
+          final row = <dynamic>[];
           for (var i = 1; i <= ncols; i++) {
-            final name = i <= columns.length ? columns[i - 1] : 'col$i';
             final t = types[i - 1];
             final len = db.dbdatlen(dbproc, i);
             final ptr = db.dbdata(dbproc, i);
             final v = decodeDbValueWithFallback(db, dbproc, t, ptr, len);
-            row[name] = v;
+            row.add(v);
           }
           rows.add(row);
           fetched++;
         }
-        MssqlLogger.i(
-          'collectResults | op=rows | set=$setIndex | fetched=$fetched',
-        );
-      } else if (ncols > 0) {
-        // If this is a second schema-bearing set, skip its rows for shape stability
-        MssqlLogger.w(
-          'collectResults | op=skip-rows | set=$setIndex | reason=secondary-schema',
-        );
-        // Drain rows without collecting
-        while (true) {
-          final nr = db.dbnextrow(dbproc);
-          if (nr == NO_MORE_ROWS) break;
-          if (nr != REG_ROW && nr != MORE_ROWS) break;
-        }
+        MssqlLogger.i('collectResults | op=rows | set=$setIndex | fetched=$fetched');
+        resultSets.add(SqlResultSet(columns: columns, rows: rows));
       }
 
-      // Accumulate affected rows for this set
       try {
         final c = db.dbcount(dbproc);
         affectedTotal += c;
-        MssqlLogger.i(
-          'collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal',
-        );
+        MssqlLogger.i('collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal');
       } catch (e) {
         MssqlLogger.w('collectResults | op=dbcount | set=$setIndex | error=$e');
       }
     }
 
-    final result = <String, dynamic>{
-      'columns': columns,
-      'rows': rows,
-      'affected': affectedTotal,
-    };
-    if (error != null) result['error'] = error;
-    MssqlLogger.i(
-      'collectResults | status=done | rows=${rows.length} | affected=$affectedTotal',
+    MssqlLogger.i('collectResults | status=done | sets=${resultSets.length} | affected=$affectedTotal');
+    return SqlResponse(
+      resultSets: resultSets,
+      totalAffectedRows: affectedTotal,
+      error: error,
     );
-    return jsonEncode(result);
   }
 
   void _ensureConnected() {
