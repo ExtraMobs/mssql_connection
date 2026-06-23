@@ -268,8 +268,7 @@ class MssqlClient {
         }
         final res = await executeParams(sql, pm);
         try {
-          final j = jsonDecode(res);
-          final affected = (j['affected'] is int) ? j['affected'] as int : 0;
+          final affected = res.totalAffectedRows;
           if (affected > 0) total += 1;
         } catch (_) {
           // On parse error, assume failure for that row
