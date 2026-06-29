@@ -22,3 +22,5 @@ flutter:
     platforms:
       windows:
         pluginClass: MssqlConnectionPlugin
+      android:
+        ffiPlugin: true
