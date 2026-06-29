@@ -1004,12 +1004,21 @@ _RpcVal _encodeForRpc(dynamic v) {
   return _RpcVal(sb.type, sb.buf);
 }
 
-// Format DateTime in an ISO-like pattern accepted by SQL Server, without 'Z'.
-// Example: 2025-08-28T02:34:56
+// Format DateTime into a string accepted by SQL Server for implicit varchar->datetime conversion.
+//
+// Contract:
+// - This function does NOT validate the DateTime value. Validation is the caller's responsibility.
+// - Dart's DateTime constructor normalizes out-of-range fields (e.g., month=99 overflows into
+//   extra years). The resulting normalized date is formatted and sent as-is.
+//   If the resulting value is outside SQL Server's supported DATETIME range
+//   (1753-01-01 to 9999-12-31), SQL Server will reject it and the driver will
+//   surface a SQLException with the server's error message. No silent truncation occurs.
+// - The format 'yyyy-MM-dd HH:mm:ss' (space separator, no fractional seconds) is used
+//   because it is unambiguously parsed by SQL Server regardless of DATEFORMAT/locale setting.
+//   The ISO8601 'T' separator is intentionally avoided — SQL Server rejects it in implicit
+//   varchar->datetime conversions under certain DATEFORMAT configurations.
 String _formatDateTimeForSql(DateTime dt) {
   String two(int n) => n < 10 ? '0$n' : '$n';
-  // ISO8601-like but using space instead of T so SQL Server varchar->datetime
-  // conversion works regardless of DATEFORMAT/locale setting.
   return '${dt.year.toString().padLeft(4, '0')}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
 }
 
