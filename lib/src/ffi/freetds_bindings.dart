@@ -467,9 +467,11 @@ class DBLib {
     dbsetlname = _lib.lookupFunction<_dbsetlnameC, _dbsetlnameDart>(
       'dbsetlname',
     ); // Set LOGINREC field by selector
-    dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>(
-      'dbopen',
-    ); // Open DBPROCESS connection
+    try {
+      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('dbopen');
+    } catch (_) {
+      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('tdsdbopen');
+    }
     dbclose = _lib.lookupFunction<_dbcloseC, _dbcloseDart>(
       'dbclose',
     ); // Close DBPROCESS
