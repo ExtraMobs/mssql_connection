@@ -520,10 +520,7 @@ class MssqlClient {
         0,
         stmtBuf.type,
         -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (stmtBuf.type == SYBNVARCHAR)
-            ? (stmtBuf.buf.length >> 1)
-            : stmtBuf.buf.length,
+        stmtBuf.buf.length, // datalen: raw byte count
         stmtBuf.buf.ptr,
       );
       malloc.free(nameStmt);
@@ -549,10 +546,7 @@ class MssqlClient {
         0,
         paramsBuf.type,
         -1, // maxlen: -1 for non-OUTPUT
-        // datalen: NVARCHAR expects character count; VARCHAR expects bytes
-        (paramsBuf.type == SYBNVARCHAR)
-            ? (paramsBuf.buf.length >> 1)
-            : paramsBuf.buf.length,
+        paramsBuf.buf.length, // datalen: raw byte count
         paramsBuf.buf.ptr,
       );
       malloc.free(nameParams);
@@ -582,11 +576,7 @@ class MssqlClient {
           0, // input param
           rpcVal.type,
           -1, // maxlen: -1 for non-OUTPUT
-          (rpcVal.type == SYBNVARCHAR)
-              ? (rpcVal.buf.length << 1)
-              : rpcVal
-                    .buf
-                    .length, // datalen: for NVARCHAR pass character count; for others, bytes
+          rpcVal.buf.length, // datalen: raw byte count
           rpcVal.buf.ptr,
         );
         malloc.free(cname);
@@ -679,9 +669,7 @@ class MssqlClient {
           0, // input param
           rpcVal.type,
           -1, // maxlen
-          (rpcVal.type == SYBNVARCHAR)
-              ? (rpcVal.buf.length << 1)
-              : rpcVal.buf.length,
+          rpcVal.buf.length, // datalen: raw byte count
           rpcVal.buf.ptr,
         );
         malloc.free(cname);
@@ -833,9 +821,9 @@ class MssqlClient {
     }
     if (v is double) return 'float';
     if (v is String) return 'nvarchar(max)';
-    // Declare DateTime parameters as NVARCHAR and let SQL convert explicitly
-    // (e.g., CONVERT(datetime2, @when)). This avoids binary TDS packing.
-    if (v is DateTime) return 'nvarchar(50)';
+    // Declare DateTime parameters as VARCHAR(50) so it matches the SYBVARCHAR 
+    // encoding perfectly, allowing SQL Server to explicitly/implicitly convert it.
+    if (v is DateTime) return 'varchar(50)';
     if (v is Uint8List) return 'varbinary(max)';
     // Fallback to NVARCHAR
     return 'nvarchar(max)';
@@ -1019,9 +1007,10 @@ _RpcVal _encodeForRpc(dynamic v) {
 // Format DateTime in an ISO-like pattern accepted by SQL Server, without 'Z'.
 // Example: 2025-08-28T02:34:56
 String _formatDateTimeForSql(DateTime dt) {
-  final d = dt.toUtc();
   String two(int n) => n < 10 ? '0$n' : '$n';
-  return '${d.year.toString().padLeft(4, '0')}-${two(d.month)}-${two(d.day)}T${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+  // ISO8601-like but using space instead of T so SQL Server varchar->datetime
+  // conversion works regardless of DATEFORMAT/locale setting.
+  return '${dt.year.toString().padLeft(4, '0')}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
 }
 
 class _StringDbBuf {
