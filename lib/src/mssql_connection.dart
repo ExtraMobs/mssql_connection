@@ -84,7 +84,7 @@ class MssqlConnection {
       return true;
     } catch (e, st) {
       MssqlLogger.e('connect failed: $e\n$st');
-      return false;
+      rethrow;
     }
   }
 

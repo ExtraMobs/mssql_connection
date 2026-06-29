@@ -175,7 +175,7 @@ class MssqlClient {
     } catch (e, st) {
       MssqlLogger.e('connect | exception=$e');
       MssqlLogger.w('connect | stacktrace=\n$st');
-      return false;
+      rethrow;
     }
   }
 
