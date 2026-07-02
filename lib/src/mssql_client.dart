@@ -99,6 +99,13 @@ class MssqlClient {
         return false;
       }
 
+      final c = 'UTF-8'.toNativeUtf8();
+      try {
+        _db!.dbsetlcharset(login, c);
+      } finally {
+        malloc.free(c);
+      }
+
       final u = username.toNativeUtf8();
       final p = password.toNativeUtf8();
       try {

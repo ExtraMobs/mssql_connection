@@ -104,6 +104,7 @@ const int DBTEXTSIZE = 17; // set text size for large text retrieval
 // Per sybdb.h, DBSETUSER and DBSETPWD constants used with dbsetlname()
 const int DBSETUSER = 2;
 const int DBSETPWD = 3;
+const int DBSETCHARSET = 10;
 
 // RPC options (per sybdb.h)
 // DBRPCRECOMPILE causes the stored procedure to be recompiled before executing.
@@ -605,6 +606,10 @@ class DBLib {
   int dbsetlpwd(Pointer<LOGINREC> login, Pointer<Utf8> password) =>
       dbsetlname(login, password, DBSETPWD);
 
+  /// Set the charset on a LOGINREC using the DBSETCHARSET selector.
+  int dbsetlcharset(Pointer<LOGINREC> login, Pointer<Utf8> charset) =>
+      dbsetlname(login, charset, DBSETCHARSET);
+
   static DBLib load() => DBLib(NativeLoader.loadDBLib());
 
   // Expose latest DB-Lib error/message captured by installed handlers.
@@ -835,7 +840,11 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
       {
         final bytes = ptr.asTypedList(len);
         if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
-        return utf8.decode(bytes, allowMalformed: true);
+        try {
+          return utf8.decode(bytes, allowMalformed: false);
+        } catch (_) {
+          return latin1.decode(bytes, allowInvalid: true);
+        }
       }
     case SYBNTEXT:
     case SYBNVARCHAR:
@@ -923,7 +932,11 @@ String? tryConvertToString(
     );
     if (outLen <= 0) return null;
     final bytes = dest.asTypedList(outLen);
-    return utf8.decode(bytes, allowMalformed: true);
+    try {
+      return utf8.decode(bytes, allowMalformed: false);
+    } catch (_) {
+      return latin1.decode(bytes, allowInvalid: true);
+    }
   } catch (_) {
     return null;
   } finally {
