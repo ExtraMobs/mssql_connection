@@ -915,8 +915,29 @@ dynamic decodeDbValueWithFallback(
     }
   }
   if (v is Uint8List) {
-    final s = tryConvertToString(db, dbproc, type, ptr, len);
-    if (s != null) return s;
+    String? s = tryConvertToString(db, dbproc, type, ptr, len);
+    if (s != null) {
+      // Fix FreeTDS legacy date formats (e.g. "Jan  1 1900  7:45:00:0000000AM")
+      if (type == SYBMSDATETIME2 || type == SYBMSDATE || type == SYBMSTIME || type == SYBMSDATETIMEOFFSET || type == SYBDATETIME || type == SYBDATETIME4 || type == SYBDATETIMN) {
+        final match = RegExp(r'^([A-Z][a-z]{2})\s+(\d+)\s+(\d{4})\s+(\d+):(\d{2})(?::(\d{2})(?::(\d+))?)?([AP]M)$', caseSensitive: false).firstMatch(s.trim());
+        if (match != null) {
+          final months = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12};
+          final mStr = match.group(1)!;
+          final m = months[mStr.substring(0, 1).toUpperCase() + mStr.substring(1).toLowerCase()] ?? 1;
+          final d = int.parse(match.group(2)!);
+          final y = int.parse(match.group(3)!);
+          int h = int.parse(match.group(4)!);
+          final min = int.parse(match.group(5)!);
+          final sec = match.group(6) != null ? int.parse(match.group(6)!) : 0;
+          // Fractional seconds not easily added to DateTime without losing precision or parsing, ignoring them.
+          final ampm = match.group(8)!.toUpperCase();
+          if (ampm == 'PM' && h < 12) h += 12;
+          if (ampm == 'AM' && h == 12) h = 0;
+          s = DateTime(y, m, d, h, min, sec).toIso8601String();
+        }
+      }
+      return s;
+    }
     // Last resort: base64 the raw bytes for JSON-safety
     return base64.encode(v);
   }
