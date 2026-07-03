@@ -827,6 +827,25 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
         final dt = base.add(Duration(days: days, minutes: minutes));
         return dt.toIso8601String();
       }
+    case SYBDATETIMN:
+      {
+        if (len == 8) {
+          final days = bd!.getInt32(0, Endian.little);
+          final time300 = bd.getInt32(4, Endian.little);
+          final base = DateTime(1900, 1, 1);
+          final date = base.add(Duration(days: days));
+          final micros = (time300 * 1000000) ~/ 300;
+          final dt = date.add(Duration(microseconds: micros));
+          return dt.toIso8601String();
+        } else if (len == 4) {
+          final days = bd!.getUint16(0, Endian.little);
+          final minutes = bd.getUint16(2, Endian.little);
+          final base = DateTime(1900, 1, 1);
+          final dt = base.add(Duration(days: days, minutes: minutes));
+          return dt.toIso8601String();
+        }
+        return null;
+      }
     case SYBBINARY:
     case SYBVARBINARY:
     case SYBIMAGE:
