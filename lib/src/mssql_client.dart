@@ -385,6 +385,11 @@ class MssqlClient {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
+    
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
+
     // Detect if we should enable strict SET options for this statement
     final _SetPlan plan = _analyzeSetNeeds(sql);
     if (plan.needsSet) {
@@ -482,6 +487,10 @@ class MssqlClient {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
+
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
 
     // Normalize param names to include '@'
     final norm = <String, dynamic>{};
@@ -641,6 +650,10 @@ class MssqlClient {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
+
+    // Clear any stale messages from previous queries
+    DBLib.takeLastMessage(dbproc);
+    DBLib.takeLastError(dbproc);
 
     final norm = <String, dynamic>{};
     params.forEach((k, v) => norm[_normalizeParamName(k)] = v);
