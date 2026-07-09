@@ -1079,7 +1079,7 @@ _StringDbBuf _encodeStringSmart(String s) {
 // Characters above U+00FF are replaced with '?' (same as SQL Server behavior).
 //
 // ponytail: simple O(n) loop, no iconv, no extra deps
-Pointer<Uint8> _toLatin1Native(String s) {
+Pointer<Utf8> _toLatin1Native(String s) {
   final p = malloc<Uint8>(s.length + 1); // +1 null terminator
   final view = p.asTypedList(s.length + 1);
   for (int i = 0; i < s.length; i++) {
@@ -1087,5 +1087,5 @@ Pointer<Uint8> _toLatin1Native(String s) {
     view[i] = c <= 0xFF ? c : 0x3F; // '?' for anything above Latin-1
   }
   view[s.length] = 0; // null terminator
-  return p;
+  return p.cast<Utf8>();
 }
