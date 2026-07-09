@@ -413,7 +413,7 @@ class MssqlClient {
       }
 
       // 2) Execute the original SQL in its own batch (ensuring CREATE VIEW is first)
-      final cmd = sql.toNativeUtf8();
+      final cmd = _toLatin1Native(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -437,7 +437,7 @@ class MssqlClient {
       }
     } else {
       // Regular path
-      final cmd = sql.toNativeUtf8();
+      final cmd = _toLatin1Native(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -1068,4 +1068,24 @@ _StringDbBuf _encodeStringSmart(String s) {
     view[j + 1] = (cu >> 8) & 0xFF;
   }
   return _StringDbBuf(SYBNVARCHAR, _TempBuf(p, len));
+}
+
+// Encode a Dart string as Latin-1 (CP1252) in a null-terminated native buffer.
+//
+// FreeTDS DB-Lib without client charset config passes bytes as-is to SQL Server.
+// SQL Server with Latin-based collations (SQL_Latin1_General_CP1_CI_AS) interprets
+// VARCHAR literals as CP1252 bytes. All Portuguese characters (ç, ã, á, etc.) are
+// in Latin-1 range (≤ U+00FF), so this conversion is lossless for PT-BR.
+// Characters above U+00FF are replaced with '?' (same as SQL Server behavior).
+//
+// ponytail: simple O(n) loop, no iconv, no extra deps
+Pointer<Uint8> _toLatin1Native(String s) {
+  final p = malloc<Uint8>(s.length + 1); // +1 null terminator
+  final view = p.asTypedList(s.length + 1);
+  for (int i = 0; i < s.length; i++) {
+    final c = s.codeUnitAt(i);
+    view[i] = c <= 0xFF ? c : 0x3F; // '?' for anything above Latin-1
+  }
+  view[s.length] = 0; // null terminator
+  return p;
 }
