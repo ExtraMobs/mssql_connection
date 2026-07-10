@@ -856,6 +856,8 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
     case SYBCHAR:
     case SYBVARCHAR:
     case SYBTEXT:
+    case SYBNTEXT:
+    case SYBNVARCHAR:
       {
         final bytes = ptr.asTypedList(len);
         if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
@@ -864,14 +866,6 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
         } catch (_) {
           return latin1.decode(bytes, allowInvalid: true);
         }
-      }
-    case SYBNTEXT:
-    case SYBNVARCHAR:
-      {
-        // NVARCHAR/NTEXT are UTF-16LE; dbdatlen returns the byte length.
-        // Decode exactly [len] bytes as UTF-16LE.
-        final bytes = ptr.asTypedList(len);
-        return _utf16leDecode(bytes);
       }
     // For DECIMAL/NUMERIC/DATETIME, you may need proper conversion against TDS metadata.
     default:
