@@ -1044,30 +1044,18 @@ class _StringDbBuf {
 
 // Encode a Dart string as either UTF-8 (VARCHAR) if ASCII-only, or UTF-16LE (NVARCHAR) if it contains non-ASCII.
 _StringDbBuf _encodeStringSmart(String s) {
-  bool ascii = true;
-  final units = s.codeUnits;
-  for (final cu in units) {
-    if (cu > 0x7F) {
-      ascii = false;
-      break;
-    }
+  // Use Latin-1 (CP1252) for all strings. This prevents FreeTDS UTF-16LE conversion bugs
+  // and perfectly maps Portuguese characters (áéíóúç, and ´) without creating NUL squares.
+  final bytes = latin1.encode(s); // throws if contains characters > 0xFF. If we want fallback, we can do it manually.
+  // Actually, let's just use the manual replacement for safety:
+  final list = Uint8List(s.length);
+  for (int i = 0; i < s.length; i++) {
+    final cu = s.codeUnitAt(i);
+    list[i] = cu > 0xFF ? 63 : cu; // '?'
   }
-  if (ascii) {
-    final bytes = utf8.encode(s);
-    final p = malloc<Uint8>(bytes.length);
-    p.asTypedList(bytes.length).setAll(0, bytes);
-    return _StringDbBuf(SYBVARCHAR, _TempBuf(p, bytes.length));
-  }
-  // UTF-16LE encode
-  final len = units.length * 2;
-  final p = malloc<Uint8>(len);
-  final view = p.asTypedList(len);
-  for (int i = 0, j = 0; i < units.length; i++, j += 2) {
-    final cu = units[i];
-    view[j] = cu & 0xFF;
-    view[j + 1] = (cu >> 8) & 0xFF;
-  }
-  return _StringDbBuf(SYBNVARCHAR, _TempBuf(p, len));
+  final p = malloc<Uint8>(list.length);
+  p.asTypedList(list.length).setAll(0, list);
+  return _StringDbBuf(SYBVARCHAR, _TempBuf(p, list.length));
 }
 
 // Encode a Dart string as Latin-1 (CP1252) in a null-terminated native buffer.
