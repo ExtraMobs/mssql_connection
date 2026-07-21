@@ -42,7 +42,7 @@ To use the MsSQL Connection plugin in your Flutter project, follow these simple 
    Include the plugin in your Dart code:
 
    ```dart
-   import 'package:mssql_connection/mssql_connection.dart';
+   import 'package:sql_server_wrapper/mssql_connection.dart';
    ```
 
 4. **Initialize Connection**:

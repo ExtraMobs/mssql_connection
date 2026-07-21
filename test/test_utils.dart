@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:mssql_connection/mssql_connection.dart';
+import 'package:sql_server_wrapper/mssql_connection.dart';
 
 String _uniqueDbName([String prefix = 'Test']) {
   final ts = DateTime.now().millisecondsSinceEpoch;

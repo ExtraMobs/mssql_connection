@@ -2,7 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:mssql_connection/mssql_connection.dart';
+import 'package:sql_server_wrapper/mssql_connection.dart';
 void main() async {
   // Enable verbose logs to diagnose native loading/execution
   // Configure from environment for easy local testing.
