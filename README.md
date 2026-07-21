@@ -147,6 +147,21 @@ final rows = [
 ];
 final inserted = await mssqlConnection.bulkInsert('dbo.Users', rows, batchSize: 1000);
 ```
+
+---
+
+### **Execute Stored Procedures (RPC)**
+
+Execute chamadas de Stored Procedures de forma direta e segura através do protocolo RPC, utilizando o método `executeProcedure`:
+
+```dart
+final response = await mssqlConnection.executeProcedure(
+  'dbo.PROC_GetUserDetails',
+  {
+    'UserId': 123,
+    'IsActive': true,
+  },
+);
 ```
 
 ---
