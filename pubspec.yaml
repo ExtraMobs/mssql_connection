@@ -1,6 +1,6 @@
 name: mssql_connection
 description: Cross-platform Dart FFI plugin for Microsoft SQL Server databases using FreeTDS. Supports Windows, Android, iOS, macOS, and Linux natively.
-version: 3.0.0
+version: 3.0.1
 homepage: https://github.com/ExtraMobs/mssql_connection
 
 environment:
