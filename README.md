@@ -9,7 +9,7 @@ The `mssql_connection` plugin allows Flutter applications to seamlessly connect 
 ## Features
 
 - 🔄 **Cross-Platform (FFI + FreeTDS)**: Windows, Android, iOS, macOS, Linux.
-- 📊 **Unified JSON**: `{ columns: [...], rows: [...], affected: N }` for reads/writes.
+- 📊 **Native ResultSet**: Strongly-typed `SqlResponse` for fast and safe access to reads/writes without manual JSON parsing.
 - 🔒 **Parameterized Queries**: Call with `getDataWithParams`/`writeDataWithParams` to reduce injection risk.
 - 🔧 **Transactions**: `beginTransaction`, `commit`, `rollback`.
 - � **Bulk Insert**: High-throughput inserts using FreeTDS BCP.
@@ -87,9 +87,11 @@ Fetch data from the database using the `getData` method:
 
 ```dart
 String query = 'SELECT * FROM your_table';
-String result = await mssqlConnection.getData(query);
+SqlResponse result = await mssqlConnection.getData(query);
 
-// `result` contains data in JSON format.
+// `result` contains strongly-typed resultSets natively.
+print(result.resultSets.first.columns);
+print(result.resultSets.first.rows);
 ```
 
 ---
@@ -100,9 +102,11 @@ Perform insert, update, or delete operations using the `writeData` method:
 
 ```dart
 String query = 'UPDATE your_table SET column_name = "new_value" WHERE condition';
-String result = await mssqlConnection.writeData(query);
+SqlResponse result = await mssqlConnection.writeData(query);
 
-// `result` contains details about the operation, e.g., affected rows.
+// `result.totalAffectedRows` contains details about the operation.
+print('Affected rows: ${result.totalAffectedRows}');
+```
 
 ---
 
@@ -145,7 +149,8 @@ final rows = [
   {'Id': 1, 'Name': 'Alice'},
   {'Id': 2, 'Name': 'Bob'},
 ];
-final inserted = await mssqlConnection.bulkInsert('dbo.Users', rows, batchSize: 1000);
+int insertedCount = await mssqlConnection.bulkInsert('dbo.Users', rows, batchSize: 1000);
+print('Rows inserted: $insertedCount');
 ```
 
 ---
@@ -181,14 +186,14 @@ bool isDisconnected = await mssqlConnection.disconnect();
 ## 🔄 Version 3.0.0 Highlights
 
 - Cross-platform via Dart FFI + FreeTDS (Windows/Android/iOS/macOS/Linux).
-- Unified JSON response for reads/writes.
-- Parameterized queries, transactions, and bulk insertion.
+- Native typed `SqlResponse` and Python-style ResultSets for reads/writes.
+- Parameterized queries, transactions, RPC Stored Procedures, and bulk insertion.
 
 ---
 
 ## 🔐 Binary Data Handling (`VARBINARY`, `BLOB`, `BINARY`)
 
-This plugin automatically handles binary columns like `VARBINARY`, `BLOB`, and `BINARY` by **Base64 encoding** their contents in the JSON output.
+This plugin automatically handles binary columns like `VARBINARY`, `BLOB`, and `BINARY` by **Base64 encoding** their contents in the output.
 
 ### 🧪 Example
 
@@ -199,16 +204,12 @@ INSERT INTO Files (FileName, Data)
 VALUES ('example.txt', CAST('This is some binary data' AS VARBINARY(MAX)));
 ```
 
-**Flutter Output:**
+**Flutter Output (`SqlResponse.resultSets`):**
 
-```json
-{
-  "columns": ["Id", "FileName", "Data"],
-  "rows": [
-    {"Id": 1, "FileName": "example.txt", "Data": "VGhpcyBpcyBzb21lIGJpbmFyeSBkYXRh"}
-  ],
-  "affected": 0
-}
+```dart
+[
+  [1, "example.txt", "VGhpcyBpcyBzb21lIGJpbmFyeSBkYXRh"]
+]
 ```
 
 ### 📥 Decoding in Flutter
