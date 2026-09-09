@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:sql_server_wrapper/mssql_connection.dart';
 import 'package:test/test.dart';
 
@@ -6,8 +8,8 @@ import 'test_utils.dart';
 // Set RUN_DB_TESTS=1 in environment to enable tests that require a live DB + native libs.
 
 void main() {
+  final runDbTests = Platform.environment['RUN_DB_TESTS'] == '1';
   group('Negative cases - connection', () {
-
     // 1) IP address negative cases
     test('connect fails with empty IP', () async {
       final conn = MssqlConnection.getInstance();
@@ -76,18 +78,27 @@ void main() {
     });
 
     // 3) Database name negative case
-    test('connect fails when database does not exist', () async {
+    test('missing database surfaces SQL error', () async {
+      final config = TestDbConfig.current;
       final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'db_does_not_exist_123',
-        username: 'sa',
-        password: 'eSeal@123',
-        timeoutInSeconds: 2,
+      addTearDown(conn.disconnect);
+      expect(
+        await conn.connect(
+          ip: config.ip,
+          port: config.port.toString(),
+          databaseName: config.databaseName,
+          username: config.username,
+          password: config.password,
+        ),
+        isTrue,
       );
-      expect(ok, isFalse);
-    });
+      try {
+        final response = await conn.getData('USE [db_does_not_exist_123]');
+        expect(response.error, isNotNull);
+      } on SQLException {
+        // SQL errors may be returned in SqlResponse or thrown.
+      }
+    }, skip: !runDbTests);
 
     // 4) Username negative case
     test('connect fails with empty username', () async {
@@ -104,17 +115,21 @@ void main() {
     });
 
     test('connect fails with wrong username (low timeout)', () async {
+      final config = TestDbConfig.current;
       final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'master',
-        username: 'definitely-wrong',
-        password: 'eSeal@123',
-        timeoutInSeconds: 2,
+      addTearDown(conn.disconnect);
+      await expectLater(
+        conn.connect(
+          ip: config.ip,
+          port: config.port.toString(),
+          databaseName: config.databaseName,
+          username: 'definitely-wrong',
+          password: config.password,
+          timeoutInSeconds: 2,
+        ),
+        throwsA(isA<SQLException>()),
       );
-      expect(ok, isFalse);
-    });
+    }, skip: !runDbTests);
 
     // 5) Password negative case
     test('connect fails with empty password', () async {
@@ -131,17 +146,21 @@ void main() {
     });
 
     test('connect fails with wrong password (low timeout)', () async {
+      final config = TestDbConfig.current;
       final conn = MssqlConnection.getInstance();
-      final ok = await conn.connect(
-        ip: '192.168.1.10',
-        port: '1433',
-        databaseName: 'master',
-        username: 'sa',
-        password: 'definitely-wrong',
-        timeoutInSeconds: 2,
+      addTearDown(conn.disconnect);
+      await expectLater(
+        conn.connect(
+          ip: config.ip,
+          port: config.port.toString(),
+          databaseName: config.databaseName,
+          username: config.username,
+          password: 'definitely-wrong',
+          timeoutInSeconds: 2,
+        ),
+        throwsA(isA<SQLException>()),
       );
-      expect(ok, isFalse);
-    });
+    }, skip: !runDbTests);
     // 6) Timeout negative cases
     test('connect fails fast with zero timeout to unreachable port', () async {
       final conn = MssqlConnection.getInstance();
@@ -174,7 +193,6 @@ void main() {
     final harness = TempDbHarness();
 
     setUpAll(() async {
-      
       await harness.init();
       await harness.recreateTable('''
         CREATE TABLE dbo.NegItems (
@@ -185,12 +203,10 @@ void main() {
     });
 
     tearDownAll(() async {
-      
       await harness.dispose();
     });
 
     test('invalid SQL syntax throws SQLException (writeData)', () async {
-      
       await expectLater(
         harness.execute('SELEC 1'),
         throwsA(isA<SQLException>()),
@@ -198,7 +214,6 @@ void main() {
     });
 
     test('invalid SQL syntax throws SQLException (getData)', () async {
-      
       await expectLater(
         harness.query('SELET * FROM dbo.NegItems'),
         throwsA(isA<SQLException>()),
@@ -208,11 +223,9 @@ void main() {
     test(
       'missing parameter in executeParams returns error or throws',
       () async {
-        
         try {
           final out = await harness.executeParams('SELECT @missingParam', {});
-          final m = parseJson(out);
-          expect(m.containsKey('error') || (m['rows'] as List).isEmpty, isTrue);
+          expect(out.error, isNotNull);
         } on SQLException {
           // acceptable: some providers surface this as an exception
         }
@@ -220,7 +233,6 @@ void main() {
     );
 
     test('type overflow via params surfaces error', () async {
-      
       // INT column can't store > INT32 max
       final tooBig = 9223372036854775807; // fits bigint, not int
       try {
@@ -235,7 +247,6 @@ void main() {
     });
 
     test('bulkInsert into non-existent table throws', () async {
-      
       final conn = harness.client;
       final rows = [
         {'id': 1, 'name': 'a'},
@@ -248,7 +259,6 @@ void main() {
     });
 
     test('transaction rollback after error leaves table empty', () async {
-      
       final c = harness.client;
       await c.beginTransaction();
       try {
@@ -269,7 +279,6 @@ void main() {
     final harness = TempDbHarness();
 
     setUpAll(() async {
-      
       await harness.init();
       await harness.recreateTable('''
         CREATE TABLE dbo.Texts (
@@ -280,14 +289,12 @@ void main() {
     });
 
     tearDownAll(() async {
-      
       await harness.dispose();
     });
 
     test(
       'NVARCHAR parameters with non-ASCII characters are handled correctly',
       () async {
-        
         final unicode = 'こんにちは世界 👋';
         final affected = affectedCount(
           await harness.executeParams(

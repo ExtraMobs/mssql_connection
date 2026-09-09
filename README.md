@@ -12,7 +12,8 @@ The `mssql_connection` plugin allows Flutter applications to seamlessly connect 
 - 📊 **Native ResultSet**: Strongly-typed `SqlResponse` for fast and safe access to reads/writes without manual JSON parsing.
 - 🔒 **Parameterized Queries**: Call with `getDataWithParams`/`writeDataWithParams` to reduce injection risk.
 - 🔧 **Transactions**: `beginTransaction`, `commit`, `rollback`.
-- � **Bulk Insert**: High-throughput inserts using FreeTDS BCP.
+- **Text encoding**: UTF-8 throughout the client, configured explicitly at FreeTDS login.
+- **Bulk Insert**: FreeTDS BCP for non-null numeric/binary loads; parameterized INSERTs for text, dates, nulls and temporary tables.
 - ⏳ **Timeouts + Reconnect**: Login timeout and auto-reconnect on demand.
 
 ---
@@ -152,6 +153,8 @@ final rows = [
 int insertedCount = await mssqlConnection.bulkInsert('dbo.Users', rows, batchSize: 1000);
 print('Rows inserted: $insertedCount');
 ```
+
+Text loads use one parameterized INSERT per row to share the UTF-8 codec with queries and procedures. They may be slower than BCP and do not use `batchSize`. See [EXAMPLE.md](EXAMPLE.md) for return types and current limitations.
 
 ---
 

@@ -1,9 +1,24 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
 import 'package:sql_server_wrapper/mssql_connection.dart';
+
+void requireTempDbConfig() {
+  final env = Platform.environment;
+  if (env['RUN_DB_TESTS'] != '1' ||
+      env['MSSQL_SERVER']?.isNotEmpty != true ||
+      env['MSSQL_USER']?.isNotEmpty != true ||
+      ![
+        env['MSSQL_PASS'],
+        env['MSSQL_PASSWORD'],
+      ].any((p) => p?.isNotEmpty == true)) {
+    throw StateError(
+      'Temporary database tests require RUN_DB_TESTS=1, '
+      'MSSQL_SERVER, MSSQL_USER and MSSQL_PASSWORD (or MSSQL_PASS).',
+    );
+  }
+}
 
 String _uniqueDbName([String prefix = 'Test']) {
   final ts = DateTime.now().millisecondsSinceEpoch;
@@ -14,6 +29,7 @@ String _uniqueDbName([String prefix = 'Test']) {
 Future<void> runWithClientAndTempDb(
   Future<void> Function(MssqlConnection client, String dbName) body,
 ) async {
+  requireTempDbConfig();
   final server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
   final username = Platform.environment['MSSQL_USER'] ?? 'sa';
   final password =
@@ -58,18 +74,26 @@ Future<void> runWithClientAndTempDb(
 // Compat layer so tests can call client.execute/query/executeParams with
 // a MssqlConnection instance.
 extension _TestClientCompat on MssqlConnection {
-  Future<String> execute(String sql) => writeData(sql);
-  Future<String> query(String sql) => getData(sql);
-  Future<String> executeParams(String sql, Map<String, dynamic> params) =>
+  Future<SqlResponse> execute(String sql) => writeData(sql);
+  Future<SqlResponse> query(String sql) => getData(sql);
+  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) =>
       writeDataWithParams(sql, params);
 }
 
-Map<String, dynamic> parseJson(String jsonStr) =>
-    json.decode(jsonStr) as Map<String, dynamic>;
-List<dynamic> parseRows(String jsonStr) =>
-    (json.decode(jsonStr) as Map<String, dynamic>)['rows'] as List<dynamic>;
-int affectedCount(String jsonStr) =>
-    (json.decode(jsonStr) as Map<String, dynamic>)['affected'] as int? ?? 0;
+List<Map<String, dynamic>> parseRows(SqlResponse response) {
+  if (response.error != null) throw SQLException(response.error!);
+  if (response.resultSets.isEmpty) return [];
+  final set = response.resultSets.single;
+  return [
+    for (final row in set.rows)
+      Map<String, dynamic>.fromIterables(set.columns, row),
+  ];
+}
+
+int affectedCount(SqlResponse response) {
+  if (response.error != null) throw SQLException(response.error!);
+  return response.totalAffectedRows;
+}
 
 /// A reusable temp-database harness for running many tests within a single DB.
 ///
@@ -81,6 +105,7 @@ class TempDbHarness {
   late final String dbName;
 
   Future<void> init() async {
+    requireTempDbConfig();
     final server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
     final username = Platform.environment['MSSQL_USER'] ?? 'sa';
     final password =
@@ -119,9 +144,9 @@ class TempDbHarness {
     await client.disconnect();
   }
 
-  Future<String> execute(String sql) => client.execute(sql);
-  Future<String> query(String sql) => client.query(sql);
-  Future<String> executeParams(String sql, Map<String, dynamic> params) =>
+  Future<SqlResponse> execute(String sql) => client.execute(sql);
+  Future<SqlResponse> query(String sql) => client.query(sql);
+  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) =>
       client.executeParams(sql, params);
 
   /// Drops the table if it exists and recreates it using the provided CREATE TABLE statement.

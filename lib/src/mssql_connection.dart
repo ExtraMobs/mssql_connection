@@ -21,6 +21,8 @@ class MssqlConnection {
 
   bool get isConnected => _client?.isConnected == true;
 
+  /// Returns true on connection; false for invalid inputs or a failed TCP probe.
+  /// Native login failures throw SQLException containing callback diagnostics.
   Future<bool> connect({
     required String ip,
     required String port,

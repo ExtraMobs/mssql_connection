@@ -1,13 +1,12 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
 import 'ffi/freetds_bindings.dart';
+import 'ffi/freetds_text.dart';
 import 'native_logger.dart';
 import 'sql_exception.dart';
 import 'sql_response.dart';
@@ -25,9 +24,20 @@ class MssqlClient {
     required this.server,
     required this.username,
     required this.password,
-  });
+    DBLib? dbLib,
+  }) : _db = dbLib;
 
   bool get isConnected => _connected;
+
+  T _loginCall<T>(String operation, T Function() action, bool Function(T) ok) {
+    final (value, diagnostics) = DBLib.captureDiagnostics(action);
+    if (!ok(value)) {
+      throw SQLException(
+        '$operation failed${diagnostics.isEmpty ? '.' : ': ${diagnostics.join(' | ')}'}',
+      );
+    }
+    return value;
+  }
 
   /// Establish a DB-Lib connection to [server] using [username]/[password].
   ///
@@ -39,7 +49,8 @@ class MssqlClient {
   /// 4) Enable BCP option on the login (best-effort)
   /// 5) Open a DBPROCESS to the server (dbopen)
   ///
-  /// Returns true on success; false if any step fails. All native buffers
+  /// Returns true on success; false if the TCP probe fails. Native login
+  /// failures throw SQLException with callback diagnostics. All native buffers
   /// for username/password/server are freed after use.
   ///
   /// [loginTimeoutSeconds] controls how long DB-Lib waits to establish a socket
@@ -72,7 +83,6 @@ class MssqlClient {
         );
       }
       _db ??= DBLib.load();
-      _db!.dbinit();
       // Install handlers early so DB-Lib won't use its default fatal handler on errors in dbopen.
       try {
         _db!.dberrhandle(kErrHandlerPtr);
@@ -80,7 +90,9 @@ class MssqlClient {
         MssqlLogger.i('connect | op=handlers | status=installed');
       } catch (e) {
         MssqlLogger.w('connect | op=handlers | error=$e');
+        rethrow;
       }
+      _loginCall('dbinit', () => _db!.dbinit(), (rc) => rc == SUCCEED);
 
       // Configure login timeout (best set before attempting to connect)
       try {
@@ -93,34 +105,43 @@ class MssqlClient {
       }
 
       MssqlLogger.i('connect | op=dblogin');
-      final login = _db!.dblogin();
-      if (login == nullptr) {
-        MssqlLogger.e('connect | op=dblogin | error=nullptr');
-        return false;
-      }
+      final login = _loginCall(
+        'dblogin',
+        () => _db!.dblogin(),
+        (p) => p != nullptr,
+      );
 
-
-      final u = username.toNativeUtf8();
-      final p = password.toNativeUtf8();
-      try {
+      using((arena) {
+        final charset = toNativeFreeTdsText(
+          freeTdsClientCharset,
+          allocator: arena,
+        );
+        _loginCall(
+          'dbsetlcharset',
+          () => _db!.dbsetlcharset(login, charset),
+          (rc) => rc == SUCCEED,
+        );
+        final u = toNativeFreeTdsText(username, allocator: arena);
+        final p = toNativeFreeTdsText(password, allocator: arena);
         MssqlLogger.i('connect | op=dbsetluser');
-        final su = _db!.dbsetluser(login, u);
+        final su = _loginCall(
+          'dbsetluser',
+          () => _db!.dbsetluser(login, u),
+          (rc) => rc == SUCCEED,
+        );
         MssqlLogger.i('connect | op=dbsetluser | rc=$su');
 
         MssqlLogger.i('connect | op=dbsetlpwd');
-        final sp = _db!.dbsetlpwd(login, p);
+        final sp = _loginCall(
+          'dbsetlpwd',
+          () => _db!.dbsetlpwd(login, p),
+          (rc) => rc == SUCCEED,
+        );
         MssqlLogger.i('connect | op=dbsetlpwd | rc=$sp');
-
-        if (su != SUCCEED || sp != SUCCEED) {
-          MssqlLogger.e(
-            'connect | op=credentials | su=$su | sp=$sp | error=fail',
-          );
-          return false;
-        }
 
         // Enable BCP on this login so that bulk insert APIs are available on the session.
         try {
-          final rcBcp = _db!.dbsetlbool(login, DBSETBCP, 1);
+          final rcBcp = _db!.dbsetlbool(login, 1, DBSETBCP);
           MssqlLogger.i(
             'connect | op=dbsetlbool | option=DBSETBCP | value=1 | rc=$rcBcp',
           );
@@ -129,29 +150,25 @@ class MssqlClient {
             'connect | op=dbsetlbool | option=DBSETBCP | value=1 | error=$e',
           );
         }
-      } finally {
-        malloc.free(u);
-        malloc.free(p);
-      }
+      });
 
-      final srv = server.toNativeUtf8();
+      final srv = toNativeFreeTdsText(server);
       try {
         MssqlLogger.i('connect | op=dbopen | server=$server');
-        _dbproc = _db!.dbopen(login, srv);
+        _dbproc = _loginCall(
+          'dbopen',
+          () => _db!.dbopen(login, srv),
+          (p) => p != nullptr,
+        );
       } finally {
         malloc.free(srv);
-      }
-
-      if (_dbproc == nullptr) {
-        MssqlLogger.e('connect | op=dbopen | server=$server | error=nullptr');
-        return false;
       }
 
       // Increase TEXT/NTEXT retrieval limit to avoid 4096-byte default truncation.
       // Use T-SQL SET TEXTSIZE to ensure compatibility across DB-Lib variants.
       try {
         const String cmdText = 'SET TEXTSIZE 2147483647';
-        final setPtr = cmdText.toNativeUtf8();
+        final setPtr = toNativeFreeTdsText(cmdText);
         try {
           final rc1 = _db!.dbcmd(_dbproc!, setPtr);
           MssqlLogger.i('connect | op=dbcmd | sql=SET TEXTSIZE | rc=$rc1');
@@ -249,42 +266,36 @@ class MssqlClient {
     final db = _db!;
     final dbproc = _dbproc!;
 
-    // If inserting into a temp table (e.g., #tmp), fall back to parameterized INSERTs.
-    // BCP into temp tables is not consistently supported and can cause instability.
-    final tn = tableName.trim();
-    if (tn.startsWith('#')) {
-      final cols = (columns != null && columns.isNotEmpty)
-          ? List<String>.from(columns)
-          : rows.first.keys.toList(growable: false);
-      int total = 0;
-      for (final row in rows) {
-        final colList = cols
-            .map((c) => '[${c.replaceAll(']', ']]')}]')
-            .join(', ');
-        final placeholders = cols.map((c) => '@$c').join(', ');
-        final sql = 'INSERT INTO $tableName ($colList) VALUES ($placeholders)';
-        final pm = <String, dynamic>{};
-        for (final c in cols) {
-          pm['@$c'] = row[c];
-        }
-        final res = await executeParams(sql, pm);
-        try {
-          final affected = res.totalAffectedRows;
-          if (affected > 0) total += 1;
-        } catch (_) {
-          // On parse error, assume failure for that row
-        }
-      }
-      return total;
-    }
-
-    // Determine columns
     final cols = (columns != null && columns.isNotEmpty)
         ? List<String>.from(columns)
         : rows.first.keys.toList(growable: false);
 
+    // FreeTDS 1.5.4 BCP from program variables bypasses charset conversion.
+    // Route text (including DateTime/custom values and NULL inference) through RPC.
+    // ponytail: one INSERT per row for text; optimize only with a charset-aware bulk path.
+    final tn = tableName.trim();
+    if (tn.startsWith('#') ||
+        rows.any((row) => cols.any((c) => _hostTypeFor(row[c]) == SYBNTEXT))) {
+      final colList = cols
+          .map((c) => '[${c.replaceAll(']', ']]')}]')
+          .join(', ');
+      final placeholders = List.generate(cols.length, (i) => '@p$i').join(', ');
+      final sql = 'INSERT INTO $tableName ($colList) VALUES ($placeholders)';
+      int total = 0;
+      for (final row in rows) {
+        final res = await executeParams(sql, {
+          for (var i = 0; i < cols.length; i++) 'p$i': row[cols[i]],
+        });
+        if (res.error != null) {
+          throw SQLException(res.error!);
+        }
+        if (res.totalAffectedRows > 0) total++;
+      }
+      return total;
+    }
+
     // Initialize BCP
-    final tbl = tableName.toNativeUtf8();
+    final tbl = toNativeFreeTdsText(tableName);
     try {
       final rcInit = db.bcp_init(dbproc, tbl, nullptr, nullptr, DB_IN);
       if (rcInit != SUCCEED) {
@@ -369,17 +380,14 @@ class MssqlClient {
     }
   }
 
-  /// Execute a plain SQL text command and return a JSON payload.
-  ///
-  /// Returns a JSON String of the form:
-  /// { columns: [..], rows: [ {col:val,..}, ..], affected: (int), error?: (string) }
+  /// Execute a plain SQL text command and return its result sets and row counts.
   ///
   /// Logging: emits lines in the form `execute | key=value | ...`.
   Future<SqlResponse> execute(String sql) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
-    
+
     // Clear any stale messages from previous queries
     DBLib.takeLastMessage(dbproc);
     DBLib.takeLastError(dbproc);
@@ -388,7 +396,7 @@ class MssqlClient {
     final _SetPlan plan = _analyzeSetNeeds(sql);
     if (plan.needsSet) {
       // 1) Enable options in their own batch
-      final setCmd = plan.setPrefix.toNativeUtf8();
+      final setCmd = toNativeFreeTdsText(plan.setPrefix);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${plan.setPrefix.length}');
         final rc1 = db.dbcmd(dbproc, setCmd);
@@ -413,7 +421,7 @@ class MssqlClient {
       }
 
       // 2) Execute the original SQL in its own batch (ensuring CREATE VIEW is first)
-      final cmd = _toLatin1Native(sql);
+      final cmd = toNativeFreeTdsText(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -437,7 +445,7 @@ class MssqlClient {
       }
     } else {
       // Regular path
-      final cmd = _toLatin1Native(sql);
+      final cmd = toNativeFreeTdsText(sql);
       try {
         MssqlLogger.i('execute | op=dbcmd | sqlLen=${sql.length}');
         final rc1 = db.dbcmd(dbproc, cmd);
@@ -462,7 +470,7 @@ class MssqlClient {
     }
   }
 
-  /// Execute parameterized SQL via DB-Lib RPC to sp_executesql and return JSON.
+  /// Execute parameterized SQL via DB-Lib RPC to sp_executesql.
   ///
   /// - [sql]: text with @param placeholders (e.g., SELECT * FROM T WHERE c=@p)
   /// - [params]: map of parameterName -> value (name can include or omit leading @)
@@ -477,7 +485,10 @@ class MssqlClient {
   /// leverages the server to plan/execute with true parameters.
   ///
   /// Logging: emits lines in the form `executeParams | key=value | ...`.
-  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) async {
+  Future<SqlResponse> executeParams(
+    String sql,
+    Map<String, dynamic> params,
+  ) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
@@ -499,10 +510,10 @@ class MssqlClient {
     }
     final declStr = decls.join(', ');
 
-    // Prepare RPC call: sp_executesql(@stmt, @params, <params...>) with dynamic string encoding
-    final rpcName = 'sp_executesql'.toNativeUtf8();
-    final _StringDbBuf stmtBuf = _encodeStringSmart(sql);
-    final _StringDbBuf paramsBuf = _encodeStringSmart(declStr);
+    // All RPC text is UTF-8 in client memory; FreeTDS converts it to Unicode.
+    final rpcName = toNativeFreeTdsText('sp_executesql');
+    final stmtBuf = _encodeForRpc(sql);
+    final paramsBuf = _encodeForRpc(declStr);
 
     // We'll pass Utf8 pointers directly; no extra copies
     final tempAllocations = <_TempBuf>[]; // values for user params
@@ -514,7 +525,7 @@ class MssqlClient {
         MssqlLogger.e('executeParams | op=dbrpcinit | rc=$rcInit | error=fail');
         // In case previous RPC left state dirty, attempt a reset
         try {
-          final empty = ''.toNativeUtf8();
+          final empty = toNativeFreeTdsText('');
           db.dbrpcinit(dbproc, empty, DBRPCRESET);
           malloc.free(empty);
         } catch (_) {}
@@ -522,8 +533,8 @@ class MssqlClient {
         throw SQLException(em ?? 'dbrpcinit failed');
       }
 
-      // @stmt (VARCHAR or NVARCHAR based on content)
-      final nameStmt = '@stmt'.toNativeUtf8();
+      // Unicode SQL, with byte lengths measured before FreeTDS conversion.
+      final nameStmt = toNativeFreeTdsText('@stmt');
       final rcP1 = db.dbrpcparam(
         dbproc,
         nameStmt,
@@ -540,7 +551,7 @@ class MssqlClient {
         );
         // Reset RPC state to allow future dbrpcinit calls
         try {
-          final z = ''.toNativeUtf8();
+          final z = toNativeFreeTdsText('');
           db.dbrpcinit(dbproc, z, DBRPCRESET);
           malloc.free(z);
         } catch (_) {}
@@ -548,8 +559,7 @@ class MssqlClient {
         throw SQLException(em ?? 'dbrpcparam @stmt failed');
       }
 
-      // @params (can be empty) as VARCHAR or NVARCHAR based on content
-      final nameParams = '@params'.toNativeUtf8();
+      final nameParams = toNativeFreeTdsText('@params');
       final rcP2 = db.dbrpcparam(
         dbproc,
         nameParams,
@@ -565,7 +575,7 @@ class MssqlClient {
           'executeParams | op=dbrpcparam | name=@params | rc=$rcP2 | error=fail',
         );
         try {
-          final z = ''.toNativeUtf8();
+          final z = toNativeFreeTdsText('');
           db.dbrpcinit(dbproc, z, DBRPCRESET);
           malloc.free(z);
         } catch (_) {}
@@ -579,7 +589,7 @@ class MssqlClient {
         final value = e.value;
         final rpcVal = _encodeForRpc(value);
         tempAllocations.add(rpcVal.buf);
-        final cname = name.toNativeUtf8();
+        final cname = toNativeFreeTdsText(name);
         final rcPi = db.dbrpcparam(
           dbproc,
           cname,
@@ -595,7 +605,7 @@ class MssqlClient {
             'executeParams | op=dbrpcparam | name=$name | rc=$rcPi | error=fail',
           );
           try {
-            final z = ''.toNativeUtf8();
+            final z = toNativeFreeTdsText('');
             db.dbrpcinit(dbproc, z, DBRPCRESET);
             malloc.free(z);
           } catch (_) {}
@@ -634,13 +644,16 @@ class MssqlClient {
     }
   }
 
-  /// Execute a stored procedure directly via DB-Lib RPC and return JSON.
+  /// Execute a stored procedure directly via DB-Lib RPC.
   ///
   /// - [procName]: The name of the stored procedure.
   /// - [params]: map of parameterName -> value.
   ///
   /// This uses direct RPC: dbrpcinit(dbproc, procName, 0) followed by dbrpcparam for each parameter.
-  Future<SqlResponse> executeProcedure(String procName, Map<String, dynamic> params) async {
+  Future<SqlResponse> executeProcedure(
+    String procName,
+    Map<String, dynamic> params,
+  ) async {
     _ensureConnected();
     final db = _db!;
     final dbproc = _dbproc!;
@@ -653,16 +666,18 @@ class MssqlClient {
     params.forEach((k, v) => norm[_normalizeParamName(k)] = v);
     MssqlLogger.i('executeProcedure | op=normalize | count=${norm.length}');
 
-    final rpcName = procName.toNativeUtf8();
+    final rpcName = toNativeFreeTdsText(procName);
     final tempAllocations = <_TempBuf>[];
 
     try {
       MssqlLogger.i('executeProcedure | op=dbrpcinit | rpc=$procName');
       final rcInit = db.dbrpcinit(dbproc, rpcName, 0);
       if (rcInit != SUCCEED) {
-        MssqlLogger.e('executeProcedure | op=dbrpcinit | rc=$rcInit | error=fail');
+        MssqlLogger.e(
+          'executeProcedure | op=dbrpcinit | rc=$rcInit | error=fail',
+        );
         try {
-          final empty = ''.toNativeUtf8();
+          final empty = toNativeFreeTdsText('');
           db.dbrpcinit(dbproc, empty, DBRPCRESET);
           malloc.free(empty);
         } catch (_) {}
@@ -675,8 +690,8 @@ class MssqlClient {
         final value = e.value;
         final rpcVal = _encodeForRpc(value);
         tempAllocations.add(rpcVal.buf);
-        final cname = name.toNativeUtf8();
-        
+        final cname = toNativeFreeTdsText(name);
+
         final rcPi = db.dbrpcparam(
           dbproc,
           cname,
@@ -688,13 +703,16 @@ class MssqlClient {
         );
         malloc.free(cname);
         if (rcPi != SUCCEED) {
-          MssqlLogger.e('executeProcedure | op=dbrpcparam | name=$name | rc=$rcPi | error=fail');
+          MssqlLogger.e(
+            'executeProcedure | op=dbrpcparam | name=$name | rc=$rcPi | error=fail',
+          );
           try {
-            final z = ''.toNativeUtf8();
+            final z = toNativeFreeTdsText('');
             db.dbrpcinit(dbproc, z, DBRPCRESET);
             malloc.free(z);
           } catch (_) {}
-          final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
+          final em =
+              DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
           throw SQLException(em ?? 'dbrpcparam failed for $name');
         }
       }
@@ -702,7 +720,9 @@ class MssqlClient {
       MssqlLogger.i('executeProcedure | op=dbrpcsend');
       final rcSend = db.dbrpcsend(dbproc);
       if (rcSend != SUCCEED) {
-        MssqlLogger.e('executeProcedure | op=dbrpcsend | rc=$rcSend | error=fail');
+        MssqlLogger.e(
+          'executeProcedure | op=dbrpcsend | rc=$rcSend | error=fail',
+        );
         final em = DBLib.takeLastMessage(dbproc) ?? DBLib.takeLastError(dbproc);
         throw SQLException(em ?? 'dbrpcsend failed');
       }
@@ -729,15 +749,12 @@ class MssqlClient {
   ///
   /// Behavior and design:
   /// - Iterates dbresults() until NO_MORE_RESULTS.
-  /// - Captures column metadata from the first result set with columns only;
-  ///   subsequent row-bearing result sets are ignored to keep the return shape
-  ///   stable (single columns + rows list). Row counts from all sets are
-  ///   aggregated via dbcount().
+  /// - Captures every result set with columns and aggregates dbcount().
   /// - Decodes each value using decodeDbValueWithFallback() for safety.
   ///
   /// Logging: emits standardized lines prefixed with `collectResults`.
   ///
-  /// Returns JSON: { columns: [...], rows: [...], affected: (int), error?: (string) }
+  /// Returns a SqlResponse, with any result-collection error recorded separately.
   SqlResponse _collectResults(DBLib db, Pointer<DBPROCESS> dbproc) {
     final resultSets = <SqlResultSet>[];
     int affectedTotal = 0;
@@ -761,12 +778,12 @@ class MssqlClient {
       MssqlLogger.i('collectResults | op=set | index=$setIndex | ncols=$ncols');
       final types = List<int>.filled(ncols, 0);
       final columns = <String>[];
-      
+
       if (ncols > 0) {
         for (var i = 1; i <= ncols; i++) {
           final cptr = db.dbcolname(dbproc, i);
           types[i - 1] = db.dbcoltype(dbproc, i);
-          final name = cptr == nullptr ? 'col$i' : cptr.toDartString();
+          final name = cptr == nullptr ? 'col$i' : fromNativeFreeTdsText(cptr);
           columns.add(name);
         }
         MssqlLogger.i('collectResults | op=columns | count=${columns.length}');
@@ -779,7 +796,9 @@ class MssqlClient {
           final nr = db.dbnextrow(dbproc);
           if (nr == NO_MORE_ROWS) break;
           if (nr != REG_ROW && nr != MORE_ROWS) {
-            MssqlLogger.w('collectResults | op=dbnextrow | rc=$nr | warning=unexpected');
+            MssqlLogger.w(
+              'collectResults | op=dbnextrow | rc=$nr | warning=unexpected',
+            );
             break;
           }
           final row = <dynamic>[];
@@ -793,20 +812,26 @@ class MssqlClient {
           rows.add(row);
           fetched++;
         }
-        MssqlLogger.i('collectResults | op=rows | set=$setIndex | fetched=$fetched');
+        MssqlLogger.i(
+          'collectResults | op=rows | set=$setIndex | fetched=$fetched',
+        );
         resultSets.add(SqlResultSet(columns: columns, rows: rows));
       }
 
       try {
         final c = db.dbcount(dbproc);
         affectedTotal += c;
-        MssqlLogger.i('collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal');
+        MssqlLogger.i(
+          'collectResults | op=dbcount | set=$setIndex | value=$c | total=$affectedTotal',
+        );
       } catch (e) {
         MssqlLogger.w('collectResults | op=dbcount | set=$setIndex | error=$e');
       }
     }
 
-    MssqlLogger.i('collectResults | status=done | sets=${resultSets.length} | affected=$affectedTotal');
+    MssqlLogger.i(
+      'collectResults | status=done | sets=${resultSets.length} | affected=$affectedTotal',
+    );
     return SqlResponse(
       resultSets: resultSets,
       totalAffectedRows: affectedTotal,
@@ -835,7 +860,7 @@ class MssqlClient {
     }
     if (v is double) return 'float';
     if (v is String) return 'nvarchar(max)';
-    // Declare DateTime parameters as VARCHAR(50) so it matches the SYBVARCHAR 
+    // Declare DateTime parameters as VARCHAR(50) so it matches the SYBVARCHAR
     // encoding perfectly, allowing SQL Server to explicitly/implicitly convert it.
     if (v is DateTime) return 'varchar(50)';
     if (v is Uint8List) return 'varbinary(max)';
@@ -904,8 +929,8 @@ int _hostTypeFor(dynamic v) {
   if (v is double) return SYBFLT8;
   if (v is bool) return SYBBIT;
   if (v is Uint8List) return SYBVARBINARY;
-  // Default to NVARCHAR for textual data to preserve Unicode and align with SQL Server
-  return SYBNVARCHAR;
+  // NTEXT becomes NVARCHAR(MAX) with TDS 7.2+, avoiding the short VARCHAR RPC path.
+  return SYBNTEXT;
 }
 
 _TempBuf _encodeForHost(int hostType, dynamic v) {
@@ -941,27 +966,10 @@ _TempBuf _encodeForHost(int hostType, dynamic v) {
         p.asTypedList(bytes.length).setAll(0, bytes);
         return _TempBuf(p, bytes.length);
       }
-    case SYBVARCHAR:
+    case SYBNTEXT:
+      return _encodeText(v.toString());
     default:
-      {
-        // Encode as UTF-16LE for NVARCHAR host type; if type is actually SYBVARCHAR, SQL Server will convert.
-        final s = (v is String)
-            ? v
-            : (v is DateTime)
-            ? v.toIso8601String()
-            : v.toString();
-        final codeUnits = s.codeUnits;
-        // Each code unit to 2 bytes LE
-        final len = codeUnits.length * 2;
-        final p = malloc<Uint8>(len);
-        final view = p.asTypedList(len);
-        for (int i = 0, j = 0; i < codeUnits.length; i++, j += 2) {
-          final cu = codeUnits[i];
-          view[j] = cu & 0xFF;
-          view[j + 1] = (cu >> 8) & 0xFF;
-        }
-        return _TempBuf(p, len);
-      }
+      throw ArgumentError('Unsupported FreeTDS host type: $hostType');
   }
 }
 
@@ -972,50 +980,13 @@ _RpcVal _encodeForRpc(dynamic v) {
   if (v == null) {
     // Represent NULL by zero-length buffer of any type; server will see NULL
     // when dbrpcparam datalen is 0.
-    final p = malloc<Uint8>(0);
-    return _RpcVal(SYBNVARCHAR, _TempBuf(p, 0));
-  }
-  if (v is bool) {
-    final p = malloc<Uint8>();
-    p.value = v ? 1 : 0;
-    return _RpcVal(SYBBIT, _TempBuf(p, 1));
-  }
-  if (v is int) {
-    if (v < -2147483648 || v > 2147483647) {
-      final p = malloc<Int64>();
-      p.value = v;
-      return _RpcVal(SYBINT8, _TempBuf(p.cast<Uint8>(), 8));
-    } else {
-      final p = malloc<Int32>();
-      p.value = v;
-      return _RpcVal(SYBINT4, _TempBuf(p.cast<Uint8>(), 4));
-    }
-  }
-  if (v is double) {
-    final p = malloc<Double>();
-    p.value = v;
-    return _RpcVal(SYBFLT8, _TempBuf(p.cast<Uint8>(), 8));
-  }
-  if (v is Uint8List) {
-    final p = malloc<Uint8>(v.length);
-    p.asTypedList(v.length).setAll(0, v);
-    return _RpcVal(SYBVARBINARY, _TempBuf(p, v.length));
-  }
-  // Strings, DateTime, and other objects -> choose VARCHAR/UTF-16 NVARCHAR based on content
-  if (v is String) {
-    final sb = _encodeStringSmart(v);
-    return _RpcVal(sb.type, sb.buf);
+    return _RpcVal(SYBNTEXT, _TempBuf(malloc<Uint8>(0), 0));
   }
   if (v is DateTime) {
-    final s = _formatDateTimeForSql(v); // ASCII only
-    final bytes = utf8.encode(s);
-    final p = malloc<Uint8>(bytes.length);
-    p.asTypedList(bytes.length).setAll(0, bytes);
-    return _RpcVal(SYBVARCHAR, _TempBuf(p, bytes.length));
+    return _RpcVal(SYBVARCHAR, _encodeText(_formatDateTimeForSql(v)));
   }
-  final s = v.toString();
-  final sb = _encodeStringSmart(s);
-  return _RpcVal(sb.type, sb.buf);
+  final type = _hostTypeFor(v);
+  return _RpcVal(type, _encodeForHost(type, v));
 }
 
 // Format DateTime into a string accepted by SQL Server for implicit varchar->datetime conversion.
@@ -1036,44 +1007,10 @@ String _formatDateTimeForSql(DateTime dt) {
   return '${dt.year.toString().padLeft(4, '0')}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
 }
 
-class _StringDbBuf {
-  final int type; // SYBVARCHAR or SYBNVARCHAR
-  final _TempBuf buf;
-  _StringDbBuf(this.type, this.buf);
-}
-
-// Encode a Dart string as either UTF-8 (VARCHAR) if ASCII-only, or UTF-16LE (NVARCHAR) if it contains non-ASCII.
-_StringDbBuf _encodeStringSmart(String s) {
-  // Use Latin-1 (CP1252) for all strings. This prevents FreeTDS UTF-16LE conversion bugs
-  // and perfectly maps Portuguese characters (áéíóúç, and ´) without creating NUL squares.
-  final bytes = latin1.encode(s); // throws if contains characters > 0xFF. If we want fallback, we can do it manually.
-  // Actually, let's just use the manual replacement for safety:
-  final list = Uint8List(s.length);
-  for (int i = 0; i < s.length; i++) {
-    final cu = s.codeUnitAt(i);
-    list[i] = cu > 0xFF ? 63 : cu; // '?'
-  }
-  final p = malloc<Uint8>(list.length);
-  p.asTypedList(list.length).setAll(0, list);
-  return _StringDbBuf(SYBVARCHAR, _TempBuf(p, list.length));
-}
-
-// Encode a Dart string as Latin-1 (CP1252) in a null-terminated native buffer.
-//
-// FreeTDS DB-Lib without client charset config passes bytes as-is to SQL Server.
-// SQL Server with Latin-based collations (SQL_Latin1_General_CP1_CI_AS) interprets
-// VARCHAR literals as CP1252 bytes. All Portuguese characters (ç, ã, á, etc.) are
-// in Latin-1 range (≤ U+00FF), so this conversion is lossless for PT-BR.
-// Characters above U+00FF are replaced with '?' (same as SQL Server behavior).
-//
-// ponytail: simple O(n) loop, no iconv, no extra deps
-Pointer<Utf8> _toLatin1Native(String s) {
-  final p = malloc<Uint8>(s.length + 1); // +1 null terminator
-  final view = p.asTypedList(s.length + 1);
-  for (int i = 0; i < s.length; i++) {
-    final c = s.codeUnitAt(i);
-    view[i] = c <= 0xFF ? c : 0x3F; // '?' for anything above Latin-1
-  }
-  view[s.length] = 0; // null terminator
-  return p.cast<Utf8>();
+// Length-delimited values preserve embedded NUL; datalen is always bytes.
+_TempBuf _encodeText(String text) {
+  final bytes = freeTdsTextCodec.encode(text);
+  final p = malloc<Uint8>(bytes.length);
+  p.asTypedList(bytes.length).setAll(0, bytes);
+  return _TempBuf(p, bytes.length);
 }

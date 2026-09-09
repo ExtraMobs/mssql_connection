@@ -17,6 +17,7 @@ void main() {
     late String dbName;
 
     setUpAll(() async {
+      requireTempDbConfig();
       // Read connection info from env with sensible fallbacks
       server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
       username = Platform.environment['MSSQL_USER'] ?? 'sa';
@@ -151,8 +152,6 @@ void main() {
       final ok = await conn.disconnect();
       expect(ok, isTrue);
       expect(conn.isConnected, isFalse);
-
-     
     });
   });
 }

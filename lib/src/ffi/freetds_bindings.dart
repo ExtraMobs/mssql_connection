@@ -15,35 +15,15 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
+import '../native_logger.dart';
+
 import 'package:ffi/ffi.dart';
 
 import '../native_loader.dart';
+import 'freetds_text.dart';
 
 // Opaque types
 base class DBPROCESS extends Opaque {}
-
-// Minimal UTF-16LE decoder (assumes even-length input of UCS-2/UTF-16LE code units)
-String _utf16leDecode(Uint8List bytes) {
-  final n = bytes.length & ~1; // even length
-  final codes = List<int>.filled(n >> 1, 0);
-  for (int i = 0, j = 0; i < n; i += 2, j++) {
-    codes[j] = bytes[i] | (bytes[i + 1] << 8);
-  }
-  return String.fromCharCodes(codes);
-}
-
-// Heuristic: detect if a byte array likely contains UTF-16LE encoded text mistakenly
-// tagged as VARCHAR (i.e., ASCII bytes with 0x00 interleaved). We check for even length
-// and a high ratio of zero bytes in odd positions.
-bool _looksUtf16LeText(Uint8List bytes) {
-  if (bytes.length < 2 || (bytes.length & 1) == 1) return false;
-  // If any odd index contains 0x00, it's likely UTF-16LE (for ASCII-range chars)
-  // Allow odd-length inputs; the last trailing byte will be ignored by the decoder.
-  for (int i = 1; i < bytes.length; i += 2) {
-    if (bytes[i] == 0) return true;
-  }
-  return false;
-}
 
 base class LOGINREC extends Opaque {}
 
@@ -117,9 +97,9 @@ const int DBRPCRESET = 0x0002;
 // Group: Connection lifecycle (init/login/open/close)
 // These map to DB-Lib primitives to initialize the library, create a LOGINREC,
 // set credentials, open a DBPROCESS (connection), and cleanly close/exit.
-/// C: void dbinit(void) — Initialize DB-Lib (call once in process before using DB-Lib)
-typedef _dbinitC = Void Function();
-typedef _dbinitDart = void Function();
+/// C: RETCODE dbinit(void) — Initialize DB-Lib.
+typedef _dbinitC = Int32 Function();
+typedef _dbinitDart = int Function();
 
 /// C: LOGINREC* dblogin(void) — Allocate a login record handle
 typedef _dbloginC = Pointer<LOGINREC> Function();
@@ -203,7 +183,7 @@ typedef _dbuseC = Int32 Function(Pointer<DBPROCESS>, Pointer<Utf8>);
 typedef _dbuseDart = int Function(Pointer<DBPROCESS>, Pointer<Utf8>);
 
 // Group: LOGINREC options (e.g., enable BCP using DBSETBCP)
-/// C: int dbsetlbool(LOGINREC*, int option, int value) — Toggle login options
+/// C: int dbsetlbool(LOGINREC*, int value, int which) — Toggle login options
 typedef _dbsetlboolC = Int32 Function(Pointer<LOGINREC>, Int32, Int32);
 typedef _dbsetlboolDart = int Function(Pointer<LOGINREC>, int, int);
 
@@ -612,6 +592,19 @@ class DBLib {
 
   static DBLib load() => DBLib(NativeLoader.loadDBLib());
 
+  // Capture synchronously: a failed dbopen may report a temporary DBPROCESS
+  // in its callbacks but return nullptr, making per-pointer lookup impossible.
+  static (T, List<String>) captureDiagnostics<T>(T Function() action) {
+    final previous = _DbLibErrorStore.capture;
+    final messages = <String>[];
+    _DbLibErrorStore.capture = messages;
+    try {
+      return (action(), messages);
+    } finally {
+      _DbLibErrorStore.capture = previous;
+    }
+  }
+
   // Expose latest DB-Lib error/message captured by installed handlers.
   // These are per-DBPROCESS (or 0 for library-level) and are cleared on read.
   static String? takeLastError(Pointer<DBPROCESS>? dbproc) =>
@@ -622,6 +615,7 @@ class DBLib {
 
 // Simple global store for the latest error/message per DBPROCESS.
 class _DbLibErrorStore {
+  static List<String>? capture;
   static final Map<int, String> _lastError = <int, String>{};
   static final Map<int, String> _lastMessage = <int, String>{};
   static String? takeLastError(Pointer<DBPROCESS>? dbproc) {
@@ -630,6 +624,7 @@ class _DbLibErrorStore {
   }
 
   static void setLastError(Pointer<DBPROCESS>? dbproc, String msg) {
+    capture?.add(msg);
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastError[k] = msg;
   }
@@ -640,12 +635,32 @@ class _DbLibErrorStore {
   }
 
   static void setLastMessage(Pointer<DBPROCESS>? dbproc, String msg) {
+    capture?.add(msg);
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastMessage[k] = msg;
   }
 }
 
 // Dart-side error handlers (installed via dberrhandle/dbmsghandle).
+// Diagnostics must not throw through a native callback. Malformed sequences
+// become U+FFFD here only; result data is decoded strictly with the same codec.
+String _decodeDiagnostic(Pointer<Utf8> text) {
+  if (text == nullptr) return '';
+  try {
+    final bytes = text.cast<Uint8>();
+    var length = 0;
+    while (length < 4096 && bytes[length] != 0) {
+      length++;
+    }
+    return freeTdsTextCodec.decode(
+      bytes.asTypedList(length),
+      allowMalformed: true,
+    );
+  } catch (_) {
+    return '';
+  }
+}
+
 int _dartDbErrHandler(
   Pointer<DBPROCESS> dbproc,
   int severity,
@@ -654,32 +669,16 @@ int _dartDbErrHandler(
   Pointer<Utf8> dberrstr,
   Pointer<Utf8> oserrstr,
 ) {
-  // Be extremely defensive: message buffers may not be valid UTF-8.
-  String safeFromUtf8(Pointer<Utf8> p) {
-    if (p == nullptr) return '';
-    try {
-      return p.toDartString();
-    } catch (_) {
-      // Fallback: read up to 4KB, stop at NUL, and decode as latin1 to avoid throws.
-      try {
-        final bytes = <int>[];
-        for (int i = 0; i < 4096; i++) {
-          final b = p.cast<Uint8>().elementAt(i).value;
-          if (b == 0) break;
-          bytes.add(b);
-        }
-        return const Latin1Codec(allowInvalid: true).decode(bytes);
-      } catch (_) {
-        return '';
-      }
-    }
-  }
-
   final msg =
       '[severity=$severity dberr=$dberr oserr=$oserr] '
-      '${safeFromUtf8(dberrstr)}'
-      '${oserrstr == nullptr ? '' : ' | ${safeFromUtf8(oserrstr)}'}';
+      '${_decodeDiagnostic(dberrstr)}'
+      '${oserrstr == nullptr ? '' : ' | ${_decodeDiagnostic(oserrstr)}'}';
   _DbLibErrorStore.setLastError(dbproc, msg);
+  try {
+    MssqlLogger.e('DB-Lib callback | $msg');
+  } catch (_) {
+    // Logging must not throw through a native callback.
+  }
   return 0; // per DB-Lib docs, return value ignored
 }
 
@@ -693,29 +692,15 @@ int _dartDbMsgHandler(
   Pointer<Utf8> proc,
   int line,
 ) {
-  String safeFromUtf8(Pointer<Utf8> p) {
-    if (p == nullptr) return '';
-    try {
-      return p.toDartString();
-    } catch (_) {
-      try {
-        final bytes = <int>[];
-        for (int i = 0; i < 4096; i++) {
-          final b = p.cast<Uint8>().elementAt(i).value;
-          if (b == 0) break;
-          bytes.add(b);
-        }
-        return const Latin1Codec(allowInvalid: true).decode(bytes);
-      } catch (_) {
-        return '';
-      }
-    }
-  }
-
   final msg =
       '[msgno=$msgno state=$msgstate severity=$severity line=$line] '
-      '${safeFromUtf8(msgtext)}';
+      '${_decodeDiagnostic(msgtext)}';
   _DbLibErrorStore.setLastMessage(dbproc, msg);
+  try {
+    MssqlLogger.i('SQL Server callback | $msg');
+  } catch (_) {
+    // Logging must not throw through a native callback.
+  }
   return 0;
 }
 
@@ -860,12 +845,7 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
     case SYBNVARCHAR:
       {
         final bytes = ptr.asTypedList(len);
-        if (_looksUtf16LeText(bytes)) return _utf16leDecode(bytes);
-        try {
-          return utf8.decode(bytes, allowMalformed: false);
-        } catch (_) {
-          return latin1.decode(bytes, allowInvalid: true);
-        }
+        return freeTdsTextCodec.decode(bytes);
       }
     // For DECIMAL/NUMERIC/DATETIME, you may need proper conversion against TDS metadata.
     default:
@@ -912,12 +892,37 @@ dynamic decodeDbValueWithFallback(
     String? s = tryConvertToString(db, dbproc, type, ptr, len);
     if (s != null) {
       // Fix FreeTDS legacy date formats (e.g. "Jan  1 1900  7:45:00:0000000AM")
-      if (type == SYBMSDATETIME2 || type == SYBMSDATE || type == SYBMSTIME || type == SYBMSDATETIMEOFFSET || type == SYBDATETIME || type == SYBDATETIME4 || type == SYBDATETIMN) {
-        final match = RegExp(r'^([A-Z][a-z]{2})\s+(\d+)\s+(\d{4})\s+(\d+):(\d{2})(?::(\d{2})(?::(\d+))?)?([AP]M)$', caseSensitive: false).firstMatch(s.trim());
+      if (type == SYBMSDATETIME2 ||
+          type == SYBMSDATE ||
+          type == SYBMSTIME ||
+          type == SYBMSDATETIMEOFFSET ||
+          type == SYBDATETIME ||
+          type == SYBDATETIME4 ||
+          type == SYBDATETIMN) {
+        final match = RegExp(
+          r'^([A-Z][a-z]{2})\s+(\d+)\s+(\d{4})\s+(\d+):(\d{2})(?::(\d{2})(?::(\d+))?)?([AP]M)$',
+          caseSensitive: false,
+        ).firstMatch(s.trim());
         if (match != null) {
-          final months = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12};
+          final months = {
+            'Jan': 1,
+            'Feb': 2,
+            'Mar': 3,
+            'Apr': 4,
+            'May': 5,
+            'Jun': 6,
+            'Jul': 7,
+            'Aug': 8,
+            'Sep': 9,
+            'Oct': 10,
+            'Nov': 11,
+            'Dec': 12,
+          };
           final mStr = match.group(1)!;
-          final m = months[mStr.substring(0, 1).toUpperCase() + mStr.substring(1).toLowerCase()] ?? 1;
+          final m =
+              months[mStr.substring(0, 1).toUpperCase() +
+                  mStr.substring(1).toLowerCase()] ??
+              1;
           final d = int.parse(match.group(2)!);
           final y = int.parse(match.group(3)!);
           int h = int.parse(match.group(4)!);
@@ -966,11 +971,9 @@ String? tryConvertToString(
     );
     if (outLen <= 0) return null;
     final bytes = dest.asTypedList(outLen);
-    try {
-      return utf8.decode(bytes, allowMalformed: false);
-    } catch (_) {
-      return latin1.decode(bytes, allowInvalid: true);
-    }
+    return freeTdsTextCodec.decode(bytes);
+  } on FormatException {
+    rethrow;
   } catch (_) {
     return null;
   } finally {
