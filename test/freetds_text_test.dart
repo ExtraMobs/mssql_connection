@@ -14,6 +14,131 @@ import 'package:test/test.dart';
 const sample = 'João ação € “aspas” 中文 مرحبا 🙂';
 
 void main() {
+  test('failed decimal conversion cannot become a base64 result', () {
+    final db = _RecordingDb()..convertLength = -1;
+    using((arena) {
+      for (final type in [SYBDECIMAL, SYBNUMERIC]) {
+        expect(
+          () => decodeDbValueWithFallback(
+            db,
+            nullptr,
+            type,
+            arena<Uint8>(33),
+            33,
+          ),
+          throwsFormatException,
+        );
+      }
+    });
+  });
+
+  test('timeouts cannot overflow the native signed integer', () async {
+    final db = _RecordingDb();
+    final client = _clientWith(db);
+    await expectLater(
+      client.connect(loginTimeoutSeconds: 0x80000000),
+      throwsArgumentError,
+    );
+    final oversizedQuery = MssqlClient(
+      server: 'test',
+      username: 'test',
+      password: 'test',
+      queryTimeoutSeconds: 0x80000000,
+      dbLib: db,
+    );
+    await expectLater(oversizedQuery.connect(), throwsArgumentError);
+    expect(db.freedLogins, 0);
+  });
+
+  test('login records are freed on success and failure', () async {
+    final db = _RecordingDb();
+    final client = _clientWith(db);
+    await client.connect();
+    expect(db.freedLogins, 1);
+    await client.close();
+    db.failOpen = true;
+    await expectLater(client.connect(), throwsA(isA<SQLException>()));
+    expect(db.freedLogins, 2);
+  });
+
+  test('empty values are distinct from NULL on input and output', () async {
+    final db = _RecordingDb();
+    final client = _clientWith(db);
+    await client.connect();
+    await client.executeProcedure('dbo.Values', {
+      'a': '',
+      'b': Uint8List(0),
+      'c': null,
+    });
+    expect(db.params.map((p) => p.length), [0, 0, 0]);
+    expect(db.params.map((p) => p.status), [DBRPCEMPTY, DBRPCEMPTY, 0]);
+    expect(db.params.map((p) => p.isNull), [false, false, true]);
+    using((arena) {
+      final p = arena<Uint8>();
+      expect(decodeDbValue(SYBVARCHAR, p, 0), '');
+      expect(decodeDbValue(SYBVARBINARY, p, 0), '');
+      expect(decodeDbValue(SYBVARCHAR, nullptr, 0), isNull);
+    });
+  });
+
+  test(
+    'identifiers cannot inject SQL and parameter aliases cannot collide',
+    () async {
+      expect(quoteSqlName('dbo.[A]]B]'), '[dbo].[A]]B]');
+      expect(quoteSqlName('#tmp'), '[#tmp]');
+      for (final name in ['T; DELETE FROM T', 'dbo..T', '[T', 'T.', '[T]--']) {
+        expect(() => quoteSqlName(name), throwsArgumentError);
+      }
+      final db = _RecordingDb();
+      final client = _clientWith(db);
+      await client.connect();
+      await expectLater(
+        client.executeParams('SELECT @p', {'p': 1, '@P': 2}),
+        throwsArgumentError,
+      );
+      await expectLater(
+        client.executeParams('SELECT @p', {'p int);--': 1}),
+        throwsArgumentError,
+      );
+      expect(db.procedures, isEmpty);
+    },
+  );
+
+  test('money layout and datetimeoffset retain exact precision', () {
+    using((arena) {
+      final p = arena<Uint8>(16);
+      p.asTypedList(16).fillRange(0, 16, 0);
+      final bytes = ByteData.sublistView(p.asTypedList(16));
+      bytes.setUint32(4, 10000, Endian.host);
+      expect(decodeDbValue(SYBMONEY, p, 8), '1.0000');
+      bytes.setInt32(0, -1, Endian.host);
+      bytes.setUint32(4, 0xffffffff, Endian.host);
+      expect(decodeDbValue(SYBMONEY, p, 8), '-0.0001');
+      bytes.setUint64(0, 1234567, Endian.host);
+      bytes.setInt32(8, 0, Endian.host);
+      bytes.setInt16(12, 60, Endian.host);
+      expect(
+        decodeDbValue(SYBMSDATETIMEOFFSET, p, 16),
+        '1900-01-01T01:00:00.1234567+01:00',
+      );
+    });
+  });
+
+  test(
+    'unexpected row failures close the session instead of returning partial success',
+    () async {
+      final db = _RecordingDb()..rowResult = FAIL;
+      final client = _clientWith(db);
+      await client.connect();
+      await expectLater(
+        client.execute('SELECT TOP (0) * FROM T'),
+        throwsA(isA<SQLException>()),
+      );
+      expect(client.isConnected, isFalse);
+      expect(db.closed, isTrue);
+    },
+  );
+
   test(
     'failed login exposes callbacks from temporary handles without logs',
     () async {
@@ -136,7 +261,7 @@ void main() {
       expect(db.params.last.length, utf8.encode(value).length);
 
       await client.executeProcedure('dbo.Operação', {'texto': value});
-      expect(db.procedures.last, 'dbo.Operação');
+      expect(db.procedures.last, '[dbo].[Operação]');
       expect(db.params.last.type, SYBNTEXT);
       expect(db.params.last.bytes, utf8.encode(value));
 
@@ -149,7 +274,7 @@ void main() {
       );
       expect(db.procedures.last, 'sp_executesql');
       expect(db.params.last.bytes, utf8.encode(value));
-      expect(db.params.last.name, '@p0');
+      expect(db.params.last.name, '');
     }
   });
 
@@ -189,15 +314,46 @@ void main() {
           'Bytes': Uint8List.fromList([0, 255]),
         },
         {
-          'Id': 2,
+          'Id': 0x100000000,
           'Bytes': Uint8List.fromList([128]),
         },
       ], batchSize: 1),
       2,
     );
     expect(db.bcpRows, 2);
+    expect(db.bcpTypes, [SYBINT8, SYBVARBINARY]);
     expect(db.procedures, isEmpty);
   });
+
+  test(
+    'reordered columns and quoted temporary tables use named INSERTs',
+    () async {
+      for (final table in ['dbo.Values', '[#Values]']) {
+        final db = _RecordingDb();
+        final client = _clientWith(db);
+        await client.connect();
+        final columns = table.startsWith('dbo')
+            ? ['Bytes', 'Id']
+            : ['Id', 'Bytes'];
+        await client.bulkInsert(table, [
+          {
+            'Id': 1,
+            'Bytes': Uint8List.fromList([255]),
+          },
+        ], columns: columns);
+        expect(db.bcpRows, 0);
+        expect(db.procedures, ['sp_executesql']);
+        final statement = utf8.decode(db.params.first.bytes);
+        expect(statement, contains(columns.map((c) => '[$c]').join(', ')));
+        if (table.startsWith('[#')) {
+          expect(
+            db.commands.map(utf8.decode),
+            isNot(contains(startsWith('SELECT TOP (0)'))),
+          );
+        }
+      }
+    },
+  );
 
   test('text results preserve Unicode and actual NUL characters', () {
     for (final value in [sample, 'A\u0000BC', 'A\u0000n\u0000a']) {
@@ -301,21 +457,53 @@ MssqlClient _clientWith(DBLib db) => MssqlClient(
 );
 
 class _RecordingDb implements DBLib {
+  final _arena = Arena();
+  bool metadata = false;
+  int freedLogins = 0;
+  bool closed = false;
+  int rowResult = NO_MORE_ROWS;
+  _RecordingDb() {
+    addTearDown(_arena.releaseAll);
+  }
+
   bool failOpen = false;
   bool emitLoginDiagnostic = true;
   int charsetResult = SUCCEED;
+  int convertLength = 1;
   final loginEvents = <String>[];
   final commands = <List<int>>[];
   final procedures = <String>[];
-  final params = <({String name, int type, int length, List<int> bytes})>[];
+  final params =
+      <
+        ({
+          String name,
+          int type,
+          int length,
+          List<int> bytes,
+          int status,
+          bool isNull,
+        })
+      >[];
   bool _result = false;
   int bcpRows = 0;
+  final bcpTypes = <int>[];
   int _batchRows = 0;
 
   @override
   dynamic noSuchMethod(Invocation invocation) {
     final Function callback = switch (invocation.memberName) {
       #dbinit => () => SUCCEED,
+      #initialize => (dynamic a, dynamic b) => SUCCEED,
+      #dbloginfree => (dynamic p) {
+        freedLogins++;
+      },
+      #dbclose => (dynamic p) {
+        closed = true;
+      },
+      #dbsetlname => (dynamic login, dynamic value, dynamic which) => SUCCEED,
+      #dbsetopt =>
+        (dynamic process, dynamic option, dynamic text, dynamic number) =>
+            SUCCEED,
       #dberrhandle => (dynamic pointer) => kErrHandlerPtr,
       #dbmsghandle => (dynamic pointer) => kMsgHandlerPtr,
       #dbsetlogintime => (dynamic seconds) => SUCCEED,
@@ -367,6 +555,7 @@ class _RecordingDb implements DBLib {
         return Pointer<DBPROCESS>.fromAddress(2);
       },
       #dbcmd => (dynamic process, Pointer<Utf8> text) {
+        metadata = text.toDartString().startsWith('SELECT TOP (0)');
         commands.add(text.cast<Uint8>().asTypedList(text.length).toList());
         return SUCCEED;
       },
@@ -375,7 +564,13 @@ class _RecordingDb implements DBLib {
         _result = !_result;
         return _result ? SUCCEED : NO_MORE_RESULTS;
       },
-      #dbnumcols => (dynamic process) => 0,
+      #dbnumcols => (dynamic process) => metadata ? 2 : 0,
+      #dbcoltype => (dynamic process, dynamic col) => SYBINT4,
+      #dbcolname => (dynamic process, int col) => toNativeFreeTdsText(
+        ['Id', 'Bytes'][col - 1],
+        allocator: _arena,
+      ),
+      #dbnextrow => (dynamic process) => rowResult,
       #dbcount => (dynamic process) => 1,
       #bcp_init =>
         (
@@ -395,7 +590,10 @@ class _RecordingDb implements DBLib {
           dynamic terminatorLength,
           dynamic type,
           dynamic column,
-        ) => SUCCEED,
+        ) {
+          bcpTypes.add(type as int);
+          return SUCCEED;
+        },
       #bcp_collen ||
       #bcp_colptr => (dynamic process, dynamic data, dynamic column) => SUCCEED,
       #bcp_sendrow => (dynamic process) {
@@ -426,6 +624,8 @@ class _RecordingDb implements DBLib {
             name: name.toDartString(),
             type: type,
             length: length,
+            status: status as int,
+            isNull: data == nullptr,
             bytes: data.asTypedList(length).toList(),
           ));
           return SUCCEED;
@@ -441,7 +641,7 @@ class _RecordingDb implements DBLib {
           dynamic targetLength,
         ) {
           target.value = 0xe9;
-          return 1;
+          return convertLength;
         },
       _ => throw StateError(
         'Unexpected DB-Lib operation: ${invocation.memberName}',

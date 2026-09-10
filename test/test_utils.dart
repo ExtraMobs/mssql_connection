@@ -30,12 +30,11 @@ Future<void> runWithClientAndTempDb(
   Future<void> Function(MssqlConnection client, String dbName) body,
 ) async {
   requireTempDbConfig();
-  final server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
-  final username = Platform.environment['MSSQL_USER'] ?? 'sa';
+  final server = Platform.environment['MSSQL_SERVER']!;
+  final username = Platform.environment['MSSQL_USER']!;
   final password =
       Platform.environment['MSSQL_PASS'] ??
-      Platform.environment['MSSQL_PASSWORD'] ??
-      'eSeal@123';
+      Platform.environment['MSSQL_PASSWORD']!;
 
   // Parse server into ip and port (default 1433)
   final parts = server.split(':');
@@ -105,36 +104,41 @@ class TempDbHarness {
   late final String dbName;
 
   Future<void> init() async {
-    requireTempDbConfig();
-    final server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
-    final username = Platform.environment['MSSQL_USER'] ?? 'sa';
-    final password =
-        Platform.environment['MSSQL_PASS'] ??
-        Platform.environment['MSSQL_PASSWORD'] ??
-        'eSeal@123';
-    final parts = server.split(':');
-    final ip = parts.isNotEmpty ? parts.first : '127.0.0.1';
-    final port = parts.length > 1 ? parts[1] : '1433';
-
     client = MssqlConnection.getInstance();
-    final ok = await client.connect(
-      ip: ip,
-      port: port,
-      databaseName: 'master',
-      username: username,
-      password: password,
-    );
-    if (!ok) {
-      throw StateError('Failed to connect to $server as $username');
-    }
-
+    await reconnect(database: 'master');
     dbName = _uniqueDbName('Bulk');
     await client.execute('CREATE DATABASE [$dbName]');
     await client.execute('USE [$dbName]');
   }
 
+  Future<void> reconnect({String? database}) async {
+    requireTempDbConfig();
+    final server = Platform.environment['MSSQL_SERVER']!;
+    final username = Platform.environment['MSSQL_USER']!;
+    final password =
+        Platform.environment['MSSQL_PASS'] ??
+        Platform.environment['MSSQL_PASSWORD']!;
+    final parts = server.split(':');
+    final ip = parts.isNotEmpty ? parts.first : '127.0.0.1';
+    final port = parts.length > 1 ? parts[1] : '1433';
+
+    final ok = await client.connect(
+      ip: ip,
+      port: port,
+      databaseName: database ?? dbName,
+      username: username,
+      password: password,
+      caFile: Platform.environment['MSSQL_CA_FILE'] ?? 'system',
+      certificateHostname: Platform.environment['MSSQL_CERTIFICATE_HOSTNAME'],
+    );
+    if (!ok) {
+      throw StateError('Failed to connect to $server as $username');
+    }
+  }
+
   Future<void> dispose() async {
     try {
+      if (!client.isConnected) await reconnect(database: 'master');
       await client.execute('USE master');
       await client.execute(
         'ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE',

@@ -1,4 +1,5 @@
 EXPORTS
+	sql_server_wrapper_init
 	bcp_batch
 	bcp_bind
 	bcp_colfmt

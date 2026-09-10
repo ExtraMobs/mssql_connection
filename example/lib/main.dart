@@ -44,8 +44,10 @@ class _MssqlDemoState extends State<MssqlDemo> {
   final ipCtrl = TextEditingController(text: "127.0.0.1");
   final portCtrl = TextEditingController(text: "1433");
   final dbCtrl = TextEditingController(text: "master");
-  final userCtrl = TextEditingController(text: "sa");
-  final passCtrl = TextEditingController(text: "password123");
+  final userCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
+  final caCtrl = TextEditingController(text: 'system');
+  final certificateHostCtrl = TextEditingController();
 
   // Query fields
   final queryCtrl = TextEditingController(text: "SELECT * FROM #Temp");
@@ -68,6 +70,32 @@ class _MssqlDemoState extends State<MssqlDemo> {
     "query": {"id": TextEditingController()},
     "execute": {"id": TextEditingController(), "name": TextEditingController()},
   };
+
+  @override
+  void dispose() {
+    for (final controller in [
+      ipCtrl,
+      portCtrl,
+      dbCtrl,
+      userCtrl,
+      passCtrl,
+      caCtrl,
+      certificateHostCtrl,
+      queryCtrl,
+      writeCtrl,
+      paramQueryCtrl,
+      paramExecuteCtrl,
+      paramKeyCtrl,
+      paramValueCtrl,
+      tableNameCtrl,
+      columnsCtrl,
+      for (final params in _params.values) ...params.values,
+      for (final row in _bulkRows) ...row.values,
+    ]) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
 
   /// Glassmorphic card wrapper
   Widget _glassCard({required Widget child}) {
@@ -133,7 +161,14 @@ class _MssqlDemoState extends State<MssqlDemo> {
     setState(() => _loading = true);
     try {
       final res = await action();
-      setState(() => _result = res.toString());
+      final text = res is SqlResponse
+          ? [
+              for (final set in res.resultSets)
+                '${set.columns.join(', ')}\n${set.rows.map((row) => row.join(', ')).join('\n')}',
+              'Affected rows: ${res.totalAffectedRows}',
+            ].join('\n\n')
+          : res.toString();
+      if (mounted) setState(() => _result = text);
     } catch (e) {
       setState(() => _result = "❌ Error: $e");
       ScaffoldMessenger.of(context).showSnackBar(
@@ -196,8 +231,20 @@ class _MssqlDemoState extends State<MssqlDemo> {
           TextField(
             controller: passCtrl,
             decoration: const InputDecoration(labelText: "Password"),
-            onChanged: (value) => debugPrint(value),
             obscureText: true,
+          ),
+          TextField(
+            controller: caCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Trusted CA: absolute PEM path or system',
+            ),
+          ),
+          TextField(
+            controller: certificateHostCtrl,
+            decoration: const InputDecoration(
+              labelText:
+                  'Certificate hostname (optional when connecting by name)',
+            ),
           ),
           const SizedBox(height: 16),
           _neuButton("Connect", () {
@@ -209,6 +256,10 @@ class _MssqlDemoState extends State<MssqlDemo> {
                     databaseName: dbCtrl.text,
                     username: userCtrl.text,
                     password: passCtrl.text,
+                    caFile: caCtrl.text.trim(),
+                    certificateHostname: certificateHostCtrl.text.trim().isEmpty
+                        ? null
+                        : certificateHostCtrl.text.trim(),
                   )
                   .then((connected) {
                     if (connected) {
@@ -580,79 +631,25 @@ class _MssqlDemoState extends State<MssqlDemo> {
         ),
         const SizedBox(height: 20),
 
-        // Step 1: Begin
         _glassCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                "Step 1: Start a Transaction",
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
+              const Text('Run an isolated transaction'),
               const SizedBox(height: 8),
               const Text(
-                "Click below to begin a transaction.\nAny queries you run after this will be part of it.",
+                'The connection is reserved until all statements finish. Success commits; an error rolls back.',
               ),
               const SizedBox(height: 12),
-              _neuButton("Begin Transaction", () {
+              _neuButton('Run transaction', () {
                 _execute(() async {
-                  await conn.beginTransaction();
-                  setState(() => _txStatus = "Transaction started ✅");
-                  return "Transaction started";
+                  final result = await conn.transaction((tx) async {
+                    return tx.getData('SELECT 1 AS transaction_example');
+                  });
+                  setState(() => _txStatus = 'Transaction committed');
+                  return result;
                 });
               }),
-            ],
-          ),
-        ),
-        const SizedBox(height: 20),
-
-        // Step 2: Commit
-        _glassCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                "Step 2: Save your changes",
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                "If you’re happy with the queries you executed, click Commit to save them permanently.",
-              ),
-              const SizedBox(height: 12),
-              _neuButton("Commit", () {
-                _execute(() async {
-                  await conn.commit();
-                  setState(() => _txStatus = "Transaction committed 🟢");
-                  return "Transaction committed";
-                });
-              }, color: Colors.green),
-            ],
-          ),
-        ),
-        const SizedBox(height: 20),
-
-        // Step 3: Rollback
-        _glassCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                "Step 3: Undo your changes",
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                "If something went wrong, click Rollback to undo all changes made in this transaction.",
-              ),
-              const SizedBox(height: 12),
-              _neuButton("Rollback", () {
-                _execute(() async {
-                  await conn.rollback();
-                  setState(() => _txStatus = "Transaction rolled back 🔴");
-                  return "Transaction rolled back";
-                });
-              }, color: Colors.redAccent),
             ],
           ),
         ),

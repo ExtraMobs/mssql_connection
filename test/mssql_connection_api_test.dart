@@ -129,9 +129,9 @@ void main() {
 
     test('transaction helpers begin/commit', () async {
       await conn.writeData('CREATE TABLE dbo.Tx (id INT PRIMARY KEY)');
-      await conn.beginTransaction();
-      await conn.writeData('INSERT INTO dbo.Tx (id) VALUES (1)');
-      await conn.commit();
+      await conn.transaction((tx) async {
+        await tx.writeData('INSERT INTO dbo.Tx (id) VALUES (1)');
+      });
       final rows = parseRows(
         await conn.getData('SELECT COUNT(*) AS cnt FROM dbo.Tx WHERE id=1'),
       );
@@ -139,9 +139,10 @@ void main() {
     });
 
     test('transaction helpers begin/rollback', () async {
-      await conn.beginTransaction();
-      await conn.writeData('INSERT INTO dbo.Tx (id) VALUES (2)');
-      await conn.rollback();
+      await expectLater(conn.transaction((tx) async {
+        await tx.writeData('INSERT INTO dbo.Tx (id) VALUES (2)');
+        throw StateError('Rollback requested by application');
+      }), throwsStateError);
       final rows = parseRows(
         await conn.getData('SELECT COUNT(*) AS cnt FROM dbo.Tx WHERE id=2'),
       );

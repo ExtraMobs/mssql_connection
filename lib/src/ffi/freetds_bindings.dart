@@ -30,6 +30,7 @@ base class LOGINREC extends Opaque {}
 // Common return codes
 const int SUCCEED = 1;
 const int FAIL = 0;
+const int INT_CANCEL = 2;
 const int NO_MORE_RESULTS = 2; // dbresults may return NO_MORE_RESULTS
 
 // Row fetch status (dbnextrow) as per FreeTDS sybdb.h
@@ -85,6 +86,12 @@ const int DBTEXTSIZE = 17; // set text size for large text retrieval
 const int DBSETUSER = 2;
 const int DBSETPWD = 3;
 const int DBSETCHARSET = 10;
+const int DBSETENCRYPTION = 1005;
+// Private extensions in the bundled FreeTDS build; older libraries fail closed.
+const int DBSETCAFILE = 20001;
+const int DBSETCERTIFICATEHOSTNAME = 20002;
+const int DBSETTIME = 34;
+const int DBRPCEMPTY = 0x80;
 
 // RPC options (per sybdb.h)
 // DBRPCRECOMPILE causes the stored procedure to be recompiled before executing.
@@ -104,6 +111,8 @@ typedef _dbinitDart = int Function();
 /// C: LOGINREC* dblogin(void) — Allocate a login record handle
 typedef _dbloginC = Pointer<LOGINREC> Function();
 typedef _dbloginDart = Pointer<LOGINREC> Function();
+typedef _dbloginfreeC = Void Function(Pointer<LOGINREC>);
+typedef _dbloginfreeDart = void Function(Pointer<LOGINREC>);
 
 // Note: DBSETLUSER/DBSETLPWD are macros in sybdb.h that call dbsetlname()
 // with selectors DBSETUSER/DBSETPWD. We bind dbsetlname and add thin wrappers
@@ -120,9 +129,14 @@ typedef _dbopenC =
 typedef _dbopenDart =
     Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>);
 
-/// C: int dbclose(DBPROCESS*) — Close connection (DBPROCESS)
-typedef _dbcloseC = Int32 Function(Pointer<DBPROCESS>);
-typedef _dbcloseDart = int Function(Pointer<DBPROCESS>);
+typedef _tdsdbopenC =
+    Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>, Int32);
+typedef _tdsdbopenDart =
+    Pointer<DBPROCESS> Function(Pointer<LOGINREC>, Pointer<Utf8>, int);
+
+/// C: void dbclose(DBPROCESS*)
+typedef _dbcloseC = Void Function(Pointer<DBPROCESS>);
+typedef _dbcloseDart = void Function(Pointer<DBPROCESS>);
 
 /// C: void dbexit(void) — Shutdown DB-Lib (call when done with all DB work)
 typedef _dbexitC = Void Function();
@@ -270,6 +284,17 @@ typedef _dbmsghandleDart =
       Pointer<NativeFunction<_msgHandlerSigC>>,
     );
 
+typedef _wrapperInitC =
+    Int32 Function(
+      Pointer<NativeFunction<_errHandlerSigC>>,
+      Pointer<NativeFunction<_msgHandlerSigC>>,
+    );
+typedef _wrapperInitDart =
+    int Function(
+      Pointer<NativeFunction<_errHandlerSigC>>,
+      Pointer<NativeFunction<_msgHandlerSigC>>,
+    );
+
 // Group: BCP (bulk copy) — high-throughput inserts
 /// C: int bcp_init(DBPROCESS*, const char* table, const char* datafile,
 ///                 const char* errorfile, int direction)
@@ -397,7 +422,9 @@ class DBLib {
   */
   final DynamicLibrary _lib;
   late final _dbinitDart dbinit;
+  late final _wrapperInitDart initialize;
   late final _dbloginDart dblogin;
+  late final _dbloginfreeDart dbloginfree;
   late final _dbsetlnameDart dbsetlname;
   late final _dbopenDart dbopen;
   late final _dbcloseDart dbclose;
@@ -437,6 +464,9 @@ class DBLib {
   late final _dbconvertDart dbconvert;
 
   DBLib(this._lib) {
+    initialize = _lib.lookupFunction<_wrapperInitC, _wrapperInitDart>(
+      'sql_server_wrapper_init',
+    );
     // Lookups: Connection lifecycle (init/login/open/close)
     dbinit = _lib.lookupFunction<_dbinitC, _dbinitDart>(
       'dbinit',
@@ -444,6 +474,9 @@ class DBLib {
     dblogin = _lib.lookupFunction<_dbloginC, _dbloginDart>(
       'dblogin',
     ); // Create LOGINREC
+    dbloginfree = _lib.lookupFunction<_dbloginfreeC, _dbloginfreeDart>(
+      'dbloginfree',
+    );
     // DBSETLUSER/DBSETLPWD are macros -> bind the underlying function dbsetlname
     dbsetlname = _lib.lookupFunction<_dbsetlnameC, _dbsetlnameDart>(
       'dbsetlname',
@@ -451,7 +484,10 @@ class DBLib {
     try {
       dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('dbopen');
     } catch (_) {
-      dbopen = _lib.lookupFunction<_dbopenC, _dbopenDart>('tdsdbopen');
+      final open = _lib.lookupFunction<_tdsdbopenC, _tdsdbopenDart>(
+        'tdsdbopen',
+      );
+      dbopen = (login, server) => open(login, server, 1);
     }
     dbclose = _lib.lookupFunction<_dbcloseC, _dbcloseDart>(
       'dbclose',
@@ -624,7 +660,10 @@ class _DbLibErrorStore {
   }
 
   static void setLastError(Pointer<DBPROCESS>? dbproc, String msg) {
-    capture?.add(msg);
+    if (capture != null) {
+      capture!.add(msg);
+      return;
+    }
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastError[k] = msg;
   }
@@ -635,7 +674,10 @@ class _DbLibErrorStore {
   }
 
   static void setLastMessage(Pointer<DBPROCESS>? dbproc, String msg) {
-    capture?.add(msg);
+    if (capture != null) {
+      capture!.add(msg);
+      return;
+    }
     final k = dbproc == null || dbproc == nullptr ? 0 : dbproc.address;
     _lastMessage[k] = msg;
   }
@@ -679,7 +721,7 @@ int _dartDbErrHandler(
   } catch (_) {
     // Logging must not throw through a native callback.
   }
-  return 0; // per DB-Lib docs, return value ignored
+  return INT_CANCEL;
 }
 
 int _dartDbMsgHandler(
@@ -706,7 +748,7 @@ int _dartDbMsgHandler(
 
 // Exposed pointers for installation; keep them alive for the process lifetime.
 final Pointer<NativeFunction<_errHandlerSigC>> kErrHandlerPtr =
-    Pointer.fromFunction<_errHandlerSigC>(_dartDbErrHandler, 0);
+    Pointer.fromFunction<_errHandlerSigC>(_dartDbErrHandler, INT_CANCEL);
 final Pointer<NativeFunction<_msgHandlerSigC>> kMsgHandlerPtr =
     Pointer.fromFunction<_msgHandlerSigC>(_dartDbMsgHandler, 0);
 
@@ -729,10 +771,26 @@ ByteData _asByteData(Pointer<Uint8> ptr, int len) {
 ///   and binary (base64-string).
 /// - For complex types (DECIMAL/NUMERIC and newer SQL Server date/time types),
 ///   prefer [decodeDbValueWithFallback] which can call `dbconvert` to produce
-///   strings or doubles.
+///   exact decimal strings.
 /// - Returns null if [ptr] is null or [len] <= 0.
 dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
-  if (ptr == nullptr || len <= 0) return null;
+  if (ptr == nullptr) return null;
+  if (len < 0) throw FormatException('Negative DB-Lib value length');
+  if (len == 0) {
+    if ([
+      SYBCHAR,
+      SYBVARCHAR,
+      SYBTEXT,
+      SYBNTEXT,
+      SYBNVARCHAR,
+      SYBBINARY,
+      SYBVARBINARY,
+      SYBIMAGE,
+    ].contains(type)) {
+      return '';
+    }
+    throw FormatException('Empty fixed-size DB-Lib value (type=$type)');
+  }
   final bd =
       (type == SYBINT1 ||
           type == SYBCHAR ||
@@ -752,30 +810,30 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
         case 1:
           return ptr.cast<Uint8>().value;
         case 2:
-          return _asByteData(ptr, 2).getInt16(0, Endian.little);
+          return _asByteData(ptr, 2).getInt16(0, Endian.host);
         case 4:
-          return _asByteData(ptr, 4).getInt32(0, Endian.little);
+          return _asByteData(ptr, 4).getInt32(0, Endian.host);
         case 8:
-          return _asByteData(ptr, 8).getInt64(0, Endian.little);
+          return _asByteData(ptr, 8).getInt64(0, Endian.host);
         default:
           return ptr.asTypedList(len);
       }
     case SYBINT1:
       return ptr.cast<Uint8>().value;
     case SYBINT2:
-      return bd!.getInt16(0, Endian.little);
+      return bd!.getInt16(0, Endian.host);
     case SYBINT4:
-      return bd!.getInt32(0, Endian.little);
+      return bd!.getInt32(0, Endian.host);
     case SYBINT8:
-      return bd!.getInt64(0, Endian.little);
+      return bd!.getInt64(0, Endian.host);
     case SYBREAL:
-      return bd!.getFloat32(0, Endian.little);
+      return bd!.getFloat32(0, Endian.host);
     case SYBFLT8:
-      return bd!.getFloat64(0, Endian.little);
+      return bd!.getFloat64(0, Endian.host);
     case SYBFLTN:
       // infer by length
-      if (len == 4) return _asByteData(ptr, 4).getFloat32(0, Endian.little);
-      if (len == 8) return _asByteData(ptr, 8).getFloat64(0, Endian.little);
+      if (len == 4) return _asByteData(ptr, 4).getFloat32(0, Endian.host);
+      if (len == 8) return _asByteData(ptr, 8).getFloat64(0, Endian.host);
       return ptr.asTypedList(len);
     case SYBBIT:
       return ptr.cast<Uint8>().value != 0;
@@ -783,54 +841,60 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
       return len == 0 ? null : (ptr.cast<Uint8>().value != 0);
     case SYBMONEY:
       {
-        // 8-byte money: signed 64-bit scaled by 10000 (SQL Server MONEY)
-        final i64 = _asByteData(ptr, 8).getInt64(0, Endian.little);
-        return i64 / 10000.0;
+        // DBMONEY stores its high word first, independently of host endianness.
+        final value =
+            (BigInt.from(bd!.getInt32(0, Endian.host)) << 32) +
+            BigInt.from(bd.getUint32(4, Endian.host));
+        return _scaledMoney(value);
       }
     case SYBMONEY4:
       {
-        final v = bd!.getInt32(0, Endian.little); // scaled by 10000
-        return v / 10000.0;
+        return _scaledMoney(BigInt.from(bd!.getInt32(0, Endian.host)));
       }
     case SYBDATETIME:
       {
         // DBDATETIME: days since 1900-01-01, time in 1/300 sec units
-        final days = bd!.getInt32(0, Endian.little);
-        final time300 = bd.getInt32(4, Endian.little);
-        final base = DateTime(1900, 1, 1);
+        final days = bd!.getInt32(0, Endian.host);
+        final time300 = bd.getInt32(4, Endian.host);
+        final base = DateTime.utc(1900, 1, 1);
         final date = base.add(Duration(days: days));
         final micros = (time300 * 1000000) ~/ 300;
         final dt = date.add(Duration(microseconds: micros));
-        return dt.toIso8601String();
+        return dt.toIso8601String().replaceFirst('Z', '');
       }
     case SYBDATETIME4:
       {
         // DBDATETIME4: USMALLINT days since 1900-01-01, USMALLINT minutes since midnight
-        final days = bd!.getUint16(0, Endian.little);
-        final minutes = bd.getUint16(2, Endian.little);
-        final base = DateTime(1900, 1, 1);
+        final days = bd!.getUint16(0, Endian.host);
+        final minutes = bd.getUint16(2, Endian.host);
+        final base = DateTime.utc(1900, 1, 1);
         final dt = base.add(Duration(days: days, minutes: minutes));
-        return dt.toIso8601String();
+        return dt.toIso8601String().replaceFirst('Z', '');
       }
     case SYBDATETIMN:
       {
         if (len == 8) {
-          final days = bd!.getInt32(0, Endian.little);
-          final time300 = bd.getInt32(4, Endian.little);
-          final base = DateTime(1900, 1, 1);
+          final days = bd!.getInt32(0, Endian.host);
+          final time300 = bd.getInt32(4, Endian.host);
+          final base = DateTime.utc(1900, 1, 1);
           final date = base.add(Duration(days: days));
           final micros = (time300 * 1000000) ~/ 300;
           final dt = date.add(Duration(microseconds: micros));
-          return dt.toIso8601String();
+          return dt.toIso8601String().replaceFirst('Z', '');
         } else if (len == 4) {
-          final days = bd!.getUint16(0, Endian.little);
-          final minutes = bd.getUint16(2, Endian.little);
-          final base = DateTime(1900, 1, 1);
+          final days = bd!.getUint16(0, Endian.host);
+          final minutes = bd.getUint16(2, Endian.host);
+          final base = DateTime.utc(1900, 1, 1);
           final dt = base.add(Duration(days: days, minutes: minutes));
-          return dt.toIso8601String();
+          return dt.toIso8601String().replaceFirst('Z', '');
         }
         return null;
       }
+    case SYBMSDATE:
+    case SYBMSTIME:
+    case SYBMSDATETIME2:
+    case SYBMSDATETIMEOFFSET:
+      return _decodeDateTimeAll(type, bd!);
     case SYBBINARY:
     case SYBVARBINARY:
     case SYBIMAGE:
@@ -859,8 +923,7 @@ dynamic decodeDbValue(int type, Pointer<Uint8> ptr, int len) {
 /// - First, call [decodeDbValue] for fast-path common types.
 /// - If the result is raw bytes (Uint8List), attempt to convert to a readable string
 ///   via `dbconvert(..., SYBVARCHAR, ...)`.
-/// - For DECIMAL/NUMERIC specifically, try to coerce directly to double using
-///   `SYBFLT8` before falling back to string. This yields a native number shape.
+/// - DECIMAL/NUMERIC stay exact decimal strings; never round them to double.
 /// - As a last resort, base64-encode raw bytes for JSON-safety.
 dynamic decodeDbValueWithFallback(
   DBLib db,
@@ -871,71 +934,13 @@ dynamic decodeDbValueWithFallback(
 ) {
   // Prefer native decode first
   final v = decodeDbValue(type, ptr, len);
-  // Directly convert DECIMAL/NUMERIC to double if undecoded
-  if ((type == SYBDECIMAL || type == SYBNUMERIC) &&
-      v is Uint8List &&
-      ptr != nullptr &&
-      len > 0) {
-    final dest = malloc<Uint8>(8);
-    try {
-      final outLen = db.dbconvert(dbproc, type, ptr, len, SYBFLT8, dest, 8);
-      if (outLen == 8) {
-        return dest.cast<Double>().value;
-      }
-    } catch (_) {
-      // ignore and fall back to string
-    } finally {
-      malloc.free(dest);
-    }
-  }
   if (v is Uint8List) {
-    String? s = tryConvertToString(db, dbproc, type, ptr, len);
+    final s = tryConvertToString(db, dbproc, type, ptr, len);
     if (s != null) {
-      // Fix FreeTDS legacy date formats (e.g. "Jan  1 1900  7:45:00:0000000AM")
-      if (type == SYBMSDATETIME2 ||
-          type == SYBMSDATE ||
-          type == SYBMSTIME ||
-          type == SYBMSDATETIMEOFFSET ||
-          type == SYBDATETIME ||
-          type == SYBDATETIME4 ||
-          type == SYBDATETIMN) {
-        final match = RegExp(
-          r'^([A-Z][a-z]{2})\s+(\d+)\s+(\d{4})\s+(\d+):(\d{2})(?::(\d{2})(?::(\d+))?)?([AP]M)$',
-          caseSensitive: false,
-        ).firstMatch(s.trim());
-        if (match != null) {
-          final months = {
-            'Jan': 1,
-            'Feb': 2,
-            'Mar': 3,
-            'Apr': 4,
-            'May': 5,
-            'Jun': 6,
-            'Jul': 7,
-            'Aug': 8,
-            'Sep': 9,
-            'Oct': 10,
-            'Nov': 11,
-            'Dec': 12,
-          };
-          final mStr = match.group(1)!;
-          final m =
-              months[mStr.substring(0, 1).toUpperCase() +
-                  mStr.substring(1).toLowerCase()] ??
-              1;
-          final d = int.parse(match.group(2)!);
-          final y = int.parse(match.group(3)!);
-          int h = int.parse(match.group(4)!);
-          final min = int.parse(match.group(5)!);
-          final sec = match.group(6) != null ? int.parse(match.group(6)!) : 0;
-          // Fractional seconds not easily added to DateTime without losing precision or parsing, ignoring them.
-          final ampm = match.group(8)!.toUpperCase();
-          if (ampm == 'PM' && h < 12) h += 12;
-          if (ampm == 'AM' && h == 12) h = 0;
-          s = DateTime(y, m, d, h, min, sec).toIso8601String();
-        }
-      }
       return s;
+    }
+    if (type == SYBDECIMAL || type == SYBNUMERIC) {
+      throw FormatException('Cannot decode an exact SQL decimal value');
     }
     // Last resort: base64 the raw bytes for JSON-safety
     return base64.encode(v);
@@ -970,6 +975,9 @@ String? tryConvertToString(
       maxLen,
     );
     if (outLen <= 0) return null;
+    if (outLen > maxLen) {
+      throw FormatException('Native text conversion exceeded its buffer');
+    }
     final bytes = dest.asTypedList(outLen);
     return freeTdsTextCodec.decode(bytes);
   } on FormatException {
@@ -979,4 +987,40 @@ String? tryConvertToString(
   } finally {
     malloc.free(dest);
   }
+}
+
+String _scaledMoney(BigInt value) {
+  final digits = value.abs().toString().padLeft(5, '0');
+  return '${value.isNegative ? '-' : ''}${digits.substring(0, digits.length - 4)}.${digits.substring(digits.length - 4)}';
+}
+
+// DBDATETIMEALL: uint64 ticks (100 ns), int32 days, int16 offset, flags.
+// The protocol stores datetimeoffset date/time in UTC; present its civil time.
+String _decodeDateTimeAll(int type, ByteData data) {
+  if (data.lengthInBytes != 16) {
+    throw FormatException('Invalid DBDATETIMEALL length');
+  }
+  final ticks = data.getUint64(0, Endian.host);
+  final days = data.getInt32(8, Endian.host);
+  final offset = type == SYBMSDATETIMEOFFSET
+      ? data.getInt16(12, Endian.host)
+      : 0;
+  if (ticks >= 864000000000 || offset.abs() > 840) {
+    throw FormatException('Invalid DBDATETIMEALL value');
+  }
+  final civil = DateTime.utc(
+    1900,
+    1,
+    1,
+  ).add(Duration(days: days, microseconds: ticks ~/ 10, minutes: offset));
+  final date =
+      '${civil.year.toString().padLeft(4, '0')}-${civil.month.toString().padLeft(2, '0')}-${civil.day.toString().padLeft(2, '0')}';
+  if (type == SYBMSDATE) return date;
+  final time =
+      '${civil.hour.toString().padLeft(2, '0')}:${civil.minute.toString().padLeft(2, '0')}:${civil.second.toString().padLeft(2, '0')}.${(ticks % 10000000).toString().padLeft(7, '0')}';
+  if (type == SYBMSTIME) return time;
+  final zone = type == SYBMSDATETIMEOFFSET
+      ? '${offset < 0 ? '-' : '+'}${(offset.abs() ~/ 60).toString().padLeft(2, '0')}:${(offset.abs() % 60).toString().padLeft(2, '0')}'
+      : '';
+  return '${date}T$time$zone';
 }

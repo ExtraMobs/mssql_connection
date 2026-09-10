@@ -1,5 +1,5 @@
 name: sql_server_wrapper
-description: Fork of mssql_connection. Cross-platform Dart FFI plugin for Microsoft SQL Server databases using FreeTDS. Supports Windows, Android, iOS, macOS, and Linux natively.
+description: SQL Server client using Dart FFI and bundled FreeTDS. Requires verified TLS. See README for platform validation status; web is not supported.
 version: 0.0.1
 homepage: https://github.com/ExtraMobs/mssql_connection
 
@@ -23,5 +23,3 @@ flutter:
     platforms:
       windows:
         pluginClass: MssqlConnectionPlugin
-      android:
-        ffiPlugin: true

@@ -5,3 +5,5 @@ library;
 
 export 'src/mssql_connection.dart';
 export 'src/sql_exception.dart';
+
+export 'src/native_loader.dart' show NativeLoader;

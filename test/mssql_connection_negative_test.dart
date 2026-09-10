@@ -18,7 +18,7 @@ void main() {
         port: '1433',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -31,7 +31,7 @@ void main() {
         port: '1433',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -45,7 +45,7 @@ void main() {
         port: '',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -58,7 +58,7 @@ void main() {
         port: '1',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -71,7 +71,7 @@ void main() {
         port: 'abc',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -108,7 +108,7 @@ void main() {
         port: '1433',
         databaseName: 'master',
         username: '',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 2,
       );
       expect(ok, isFalse);
@@ -169,7 +169,7 @@ void main() {
         port: '1',
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: 0,
       );
       expect(ok, isFalse);
@@ -182,7 +182,7 @@ void main() {
         port: 'abc', // skip TCP probe; exercise dbopen path defensively
         databaseName: 'master',
         username: 'sa',
-        password: 'eSeal@123',
+        password: 'unused-test-password',
         timeoutInSeconds: -1,
       );
       expect(ok, isFalse);
@@ -260,18 +260,21 @@ void main() {
 
     test('transaction rollback after error leaves table empty', () async {
       final c = harness.client;
-      await c.beginTransaction();
-      try {
-        // wrong column name triggers error
-        await harness.execute(
-          "INSERT INTO dbo.NegItems (id, wrong_name) VALUES (1, N'x')",
-        );
-        fail('expected SQLException');
-      } catch (_) {
-        await c.rollback();
-      }
-      final rows = parseRows(await harness.query('SELECT * FROM dbo.NegItems'));
-      expect(rows, isEmpty);
+      await expectLater(
+        c.transaction((tx) async {
+          await tx.writeData(
+            "INSERT INTO dbo.NegItems (id, wrong_name) VALUES (1, N'x')",
+          );
+        }),
+        throwsA(isA<SQLException>()),
+      );
+      // Native errors invalidate the session; reconnect explicitly to inspect.
+      expect(c.isConnected, isFalse);
+      await harness.reconnect();
+      final rows = parseRows(
+        await harness.query('SELECT COUNT(*) AS n FROM dbo.NegItems'),
+      );
+      expect(rows.single['n'], 0);
     });
   });
 

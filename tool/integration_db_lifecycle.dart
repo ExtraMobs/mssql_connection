@@ -1,12 +1,13 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:sql_server_wrapper/mssql_connection.dart';
 
 Future<int> main() async {
   // Provided credentials
-  const server = '192.168.1.10:1433';
-  const username = 'sa';
-  const password = 'eSeal@123';
+  final server = Platform.environment['MSSQL_SERVER'] ?? (throw StateError('Explicit test configuration required'));
+  final username = Platform.environment['MSSQL_USER'] ?? (throw StateError('Explicit test configuration required'));
+  final password = Platform.environment['MSSQL_PASSWORD'] ?? (throw StateError('Explicit test configuration required'));
 
   // Parse server into ip/port
   final parts = server.split(':');

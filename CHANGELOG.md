@@ -4,20 +4,29 @@ All notable changes to this project will be documented in this file.
 ## [0.0.1]
 
 ### Added
-- Cross-platform support via Dart FFI + FreeTDS for Windows, Android, iOS, macOS, and Linux.
-- Transaction helpers: `beginTransaction`, `commit`, `rollback`.
+- Active Dart FFI + FreeTDS packaging for Windows x64. Other platform files are archived under `todo/`, with progress in `TODO.md`; they are not registered or shipped as supported platforms.
+- Exclusive callback transactions through `transaction((tx) async { ... })` and independent sessions through `MssqlConnection()`.
 - Bulk insertion API using FreeTDS BCP for high-throughput inserts.
 - Parameterized queries (via `sp_executesql`) to reduce SQL injection risk.
 
 ### Changed
-- Unified JSON response shape for all operations: `{ "columns": [...], "rows": [...], "affected": N }`.
+- SQL operations return `SqlResponse` with `resultSets` and `totalAffectedRows`.
 - Replaced platform-specific method channels/ODBC paths with a single FFI pipeline for consistent behavior.
+- Connections require TLS 1.2+, trusted certificates and hostname validation; native loading uses bundle paths.
+- Windows and Android libraries rebuilt with static OpenSSL 3.5.8; Android ELF load segments aligned for 16 KB pages.
 
 ### Fixed
 - More robust Unicode/large text handling and consistent Base64 encoding for binary columns.
+- Empty RPC values remain distinct from NULL; MONEY/DECIMAL preserve exact values as strings.
+- Validated identifiers, BCP column order and integer widths; native failures invalidate sessions instead of returning partial results.
+- Corrected native callback cancellation, ABI signatures and LOGINREC ownership; added query timeouts and result limits.
+- Removed example password logging and embedded connection credentials.
 
 ### Breaking
-- `getData`/`writeData` return a unified JSON object instead of an array-only payload. Update parsers accordingly.
+- `getData`/`writeData` return `SqlResponse`, not JSON strings.
+- Manual `beginTransaction`/`commit`/`rollback` methods throw `UnsupportedError`; migrate to `transaction`. Reconnection after native failures is explicit.
+- `DateTime` parameters use binary `datetimeoffset(7)`, preserving the Dart instant, offset and microseconds. Exact decimal and monetary results are strings.
+- Updated Dart code requires the patched native libraries; old binaries are rejected.
 
 ## [2.0.2]
 

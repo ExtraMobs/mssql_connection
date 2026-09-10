@@ -3,6 +3,7 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
+  sql_server_wrapper
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST

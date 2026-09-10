@@ -1037,6 +1037,9 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 	if (tds->login && tds->login->enable_tls_v1)
 		ctx_options &= ~SSL_OP_NO_TLSv1;
 	SSL_CTX_set_options(ctx, ctx_options);
+	/* Bundled client policy: never negotiate obsolete TLS protocols. */
+	if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION))
+		goto cleanup;
 
 	if (!tds_dstr_isempty(&tds->login->cafile)) {
 		tls_msg = "loading CA file";
@@ -1116,8 +1119,12 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 	connect_ret = SSL_connect(con);
 	ret = connect_ret != 1 || SSL_get_state(con) != TLS_ST_OK;
 	if (ret != 0) {
+		unsigned long ssl_error = ERR_peek_last_error();
 		tdsdump_log(TDS_DBG_ERROR, "handshake failed with %d %d %d\n",
 			    connect_ret, SSL_get_state(con), SSL_get_error(con, connect_ret));
+		tdsdump_log(TDS_DBG_ERROR, "TLS reason: %s; certificate: %s\n",
+			    ERR_reason_error_string(ssl_error),
+			    X509_verify_cert_error_string(SSL_get_verify_result(con)));
 		goto cleanup;
 	}
 
@@ -1131,9 +1138,10 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 
 		cert =  SSL_get_peer_certificate(con);
 		tls_msg = "checking hostname";
-		if (!cert || !check_hostname(cert, wanted_certificate_hostname(tds->login)))
-			goto cleanup;
+		ret = cert && check_hostname(cert, wanted_certificate_hostname(tds->login));
 		X509_free(cert);
+		if (!ret)
+			goto cleanup;
 	}
 
 	tdsdump_log(TDS_DBG_INFO1, "handshake succeeded!!\n");
@@ -1187,4 +1195,3 @@ tds_ssl_deinit(TDSCONNECTION *conn)
 
 #endif
 /** @} */
-

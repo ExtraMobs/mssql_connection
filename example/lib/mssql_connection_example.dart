@@ -3,14 +3,21 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:sql_server_wrapper/mssql_connection.dart';
+
 void main() async {
   // Enable verbose logs to diagnose native loading/execution
   // Configure from environment for easy local testing.
   // Set MSSQL_SERVER (e.g. 192.168.1.10:1433), MSSQL_USER, MSSQL_PASS, MSSQL_DB.
   debugPrint("Using connection settings:");
-  final server = Platform.environment['MSSQL_SERVER'] ?? '192.168.1.10:1433';
-  final username = Platform.environment['MSSQL_USER'] ?? 'sa';
-  final password = Platform.environment['MSSQL_PASS'] ?? 'eSeal@123';
+  final server =
+      Platform.environment['MSSQL_SERVER'] ??
+      (throw StateError('Explicit test configuration required'));
+  final username =
+      Platform.environment['MSSQL_USER'] ??
+      (throw StateError('Explicit test configuration required'));
+  final password =
+      Platform.environment['MSSQL_PASSWORD'] ??
+      (throw StateError('Explicit test configuration required'));
   final database = Platform.environment['MSSQL_DB'] ?? 'master';
 
   final parts = server.split(':');
@@ -48,7 +55,7 @@ void main() async {
       CAST(0x010203 AS varbinary(3)) AS vb,
       CAST(GETDATE() AS datetime) AS dt
   """);
-  debugPrint(q1);
+  showResponse(q1);
 
   // Parameterized query via sp_executesql using automatic type inference
   final params = {
@@ -60,7 +67,7 @@ void main() async {
     'SELECT @id AS id, CONVERT(datetime2, @when) AS when_dt2, @blob AS blob',
     params,
   );
-  debugPrint(q2);
+  showResponse(q2);
 
   // Basic DDL/DML using write helpers
   await conn.writeData(
@@ -70,19 +77,19 @@ void main() async {
     'INSERT INTO #tmp (id, name) VALUES (@id, @name)',
     {'@id': 1, '@name': 'Alice'},
   );
-  debugPrint(q3);
+  showResponse(q3);
   final q4 = await conn.writeDataWithParams(
     'INSERT INTO #tmp (id, name) VALUES (@id, @name)',
     {'@id': 2, '@name': 'Alice'},
   );
-  debugPrint(q4);
+  showResponse(q4);
   final q5 = await conn.writeDataWithParams(
     'UPDATE #tmp SET age = @age WHERE name = @name',
     {'@id': 2, '@name': 'Alice', '@age': 30},
   );
-  debugPrint(q5);
+  showResponse(q5);
   // Verify rows before bulk insert
-  debugPrint(await conn.getData('SELECT * FROM #tmp'));
+  showResponse(await conn.getData('SELECT * FROM #tmp'));
   // Bulk insert
   final bulkRows = [
     {'id': 3, 'name': 'Bob', 'age': 25},
@@ -95,7 +102,17 @@ void main() async {
   );
   debugPrint('Bulk insert result: $bulkResult');
   // Verify rows after bulk insert
-  debugPrint(await conn.getData('SELECT * FROM #tmp'));
+  showResponse(await conn.getData('SELECT * FROM #tmp'));
 
   await conn.disconnect();
+}
+
+void showResponse(SqlResponse response) {
+  for (final set in response.resultSets) {
+    debugPrint(set.columns.join(', '));
+    for (final row in set.rows) {
+      debugPrint(row.toString());
+    }
+  }
+  debugPrint('Affected rows: ${response.totalAffectedRows}');
 }
