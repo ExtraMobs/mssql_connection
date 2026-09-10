@@ -44,7 +44,8 @@ class MssqlConnection {
     return client;
   }
 
-  /// TLS and certificate verification are mandatory. Supply an absolute PEM CA
+  /// TLS is mandatory. Certificate verification defaults to enabled; explicitly
+  /// set trustServerCertificate to skip chain and hostname checks. Supply a PEM CA
   /// path where the platform does not provide an OpenSSL system trust store.
   Future<bool> connect({
     required String ip,
@@ -56,6 +57,7 @@ class MssqlConnection {
     int queryTimeoutSeconds = 30,
     String caFile = 'system',
     String? certificateHostname,
+    bool trustServerCertificate = false,
     int maxResultRows = 100000,
     int maxResultBytes = 64 * 1024 * 1024,
   }) => _schedule(() async {
@@ -84,6 +86,7 @@ class MssqlConnection {
       password: password,
       caFile: caFile,
       certificateHostname: certificateHostname,
+      trustServerCertificate: trustServerCertificate,
       queryTimeoutSeconds: queryTimeoutSeconds,
       maxResultRows: maxResultRows,
       maxResultBytes: maxResultBytes,

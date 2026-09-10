@@ -17,7 +17,7 @@ Este pacote Flutter, `sql_server_wrapper`, conecta ao SQL Server usando Dart FFI
 - `third_party/freetds-1.5.4/`: fonte vendorizada; `scripts/build-*.{ps1,sh}`: scripts existentes de compilação nativa. Confira o script da plataforma antes de recompilar ou substituir binários.
 - O manifesto ativo registra somente Windows. O trabalho das demais plataformas foi arquivado em `todo/` por solicitação do usuário; consulte `TODO.md`. Consulte `IMPLEMENTACAO_SEGURANCA.md` e não declare suporte validado sem testar.
 - No Windows, `windows/CMakeLists.txt` empacota `windows/Libraries/bin/sybdb.dll`, com OpenSSL estático. A configuração Android está arquivada em `todo/android/`. Mudanças no loader devem respeitar o empacotamento correspondente e não restaurar busca pelo diretório de trabalho.
-- TLS exige validação de certificado e hostname. `caFile` aceita PEM absoluto ou `system` (confiança do OpenSSL); o certificado apresentado pelo servidor não deve ser aceito automaticamente. Bibliotecas antigas sem as extensões de segurança são rejeitadas.
+- TLS permanece obrigatório. `trustServerCertificate` é `false` por padrão; `true` ignora explicitamente validação de cadeia e hostname, inclusive para autoassinados. `caFile` aceita PEM absoluto ou `system`; a configuração manual de CA/hostname ainda não foi testada de ponta a ponta com certificado confiável. A integração Windows com trustServerCertificate ativado passou. Bibliotecas antigas sem as extensões de segurança são rejeitadas.
 
 ## Parâmetros RPC
 

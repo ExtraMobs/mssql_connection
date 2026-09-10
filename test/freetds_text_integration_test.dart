@@ -46,6 +46,8 @@ void main() {
             password: env['MSSQL_PASSWORD']!,
             caFile: env['MSSQL_CA_FILE'] ?? 'system',
             certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
+            trustServerCertificate:
+                env['MSSQL_TRUST_SERVER_CERTIFICATE'] == 'true',
           ),
           isTrue,
         );

@@ -71,7 +71,9 @@ void main() {
   test('a second isolate cannot replace the native callback owner', () async {
     final db = DBLib.load();
     expect(db.initialize(kErrHandlerPtr, kMsgHandlerPtr), SUCCEED);
-    final result = await _initializeAnotherIsolate(NativeLoader.libraryDirectory);
+    final result = await _initializeAnotherIsolate(
+      NativeLoader.libraryDirectory,
+    );
     expect(result, FAIL);
     using((arena) {
       expect(
@@ -97,6 +99,7 @@ void main() {
         server: '127.0.0.1:${await ready.future}',
         username: 'dummy',
         password: 'dummy',
+        trustServerCertificate: true,
       );
       try {
         await expectLater(

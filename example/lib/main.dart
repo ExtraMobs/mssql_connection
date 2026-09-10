@@ -38,6 +38,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
 
   int _currentIndex = 0;
   bool _loading = false;
+  bool _trustServerCertificate = false;
   String _result = "";
 
   // Connection fields
@@ -239,6 +240,15 @@ class _MssqlDemoState extends State<MssqlDemo> {
               labelText: 'Trusted CA: absolute PEM path or system',
             ),
           ),
+          SwitchListTile(
+            title: const Text('Trust server certificate'),
+            subtitle: const Text(
+              'Keep TLS; skip certificate and hostname validation',
+            ),
+            value: _trustServerCertificate,
+            onChanged: (value) =>
+                setState(() => _trustServerCertificate = value),
+          ),
           TextField(
             controller: certificateHostCtrl,
             decoration: const InputDecoration(
@@ -257,6 +267,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
                     username: userCtrl.text,
                     password: passCtrl.text,
                     caFile: caCtrl.text.trim(),
+                    trustServerCertificate: _trustServerCertificate,
                     certificateHostname: certificateHostCtrl.text.trim().isEmpty
                         ? null
                         : certificateHostCtrl.text.trim(),

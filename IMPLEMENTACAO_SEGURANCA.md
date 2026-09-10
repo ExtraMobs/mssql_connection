@@ -1,5 +1,7 @@
 # Implementação das correções
 
+Atualização: `trustServerCertificate: true` foi solicitado pelo usuário e implementado como opção explícita; o padrão é `false`. A DLL Windows foi recompilada e a integração SQL/RPC/procedure/bulk/datas/transações passou no servidor de testes com essa flag. TLS continua obrigatório. A configuração manual de CA/hostname permanece **não testada de ponta a ponta com certificado confiável**; as referências abaixo à espera do PEM descrevem o bloqueio anterior ao modo opcional.
+
 Escopo atualizado pelo usuário: somente Windows permanece ativo. Os arquivos de outras plataformas foram movidos para `todo/`; [TODO.md](TODO.md) preserva os resultados e as pendências. A tabela abaixo registra também o histórico desse trabalho, sem declarar suporte ativo fora do Windows. A integração SQL Windows ainda exige o certificado confiável do servidor de testes.
 
 Estado de trabalho, 2026-09-09. A tarefa ainda não está concluída. O relatório original em `AUDITORIA_SEGURANCA_COMPATIBILIDADE.md` registra o diagnóstico anterior às alterações.

@@ -12,6 +12,7 @@ import 'sql_response.dart';
 class MssqlClient {
   final String server, username, password, caFile;
   final String? certificateHostname;
+  final bool trustServerCertificate;
   final int queryTimeoutSeconds, maxResultRows, maxResultBytes;
   DBLib? _db;
   Pointer<DBPROCESS>? _dbproc;
@@ -23,6 +24,7 @@ class MssqlClient {
     required this.password,
     this.caFile = 'system',
     this.certificateHostname,
+    this.trustServerCertificate = false,
     this.queryTimeoutSeconds = 30,
     this.maxResultRows = 100000,
     this.maxResultBytes = 64 * 1024 * 1024,
@@ -114,7 +116,11 @@ class MssqlClient {
         // Feature gate: old binaries cannot silently bypass TLS/empty-value fixes.
         _check(
           'DBSETCAFILE (requires bundled FreeTDS)',
-          () => db.dbsetlname(login, text(caFile), DBSETCAFILE),
+          () => db.dbsetlname(
+            login,
+            text(trustServerCertificate ? 'trustServerCertificate' : caFile),
+            DBSETCAFILE,
+          ),
         );
         _check(
           'DBSETCERTIFICATEHOSTNAME',

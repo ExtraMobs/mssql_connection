@@ -23,4 +23,6 @@ Builds locais Android permanecem como saídas ignoradas em `example/build/`; as 
 
 ## Windows: pendência atual
 
+Atualização: a integração SQL Windows passou usando `trustServerCertificate: true`, opção explícita solicitada posteriormente. A configuração TLS manual de CA/hostname permanece **não testada de ponta a ponta com certificado confiável**. O parágrafo abaixo registra o bloqueio anterior à flag.
+
 Windows x64 compilou em release; 21 testes Dart simulados e 3 testes nativos passaram. A integração SQL parou antes das consultas porque o servidor apresentou certificado autoassinado. É necessário fornecer o PEM confiável e o hostname para validar RPC, datas, valores exatos, bulk e transações de ponta a ponta. Isso impede afirmar que todas as correções já estão validadas com SQL Server. ARM64 não foi validado.

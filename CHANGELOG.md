@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Parameterized queries (via `sp_executesql`) to reduce SQL injection risk.
 
 ### Changed
+- Added `trustServerCertificate` (default false): explicit opt-in skips certificate chain/hostname checks while retaining mandatory TLS. Manual CA/hostname configuration remains untested end to end with a trusted certificate.
 - SQL operations return `SqlResponse` with `resultSets` and `totalAffectedRows`.
 - Replaced platform-specific method channels/ODBC paths with a single FFI pipeline for consistent behavior.
 - Connections require TLS 1.2+, trusted certificates and hostname validation; native loading uses bundle paths.

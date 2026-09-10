@@ -1,5 +1,7 @@
 # sql_server_wrapper
 
+`connect(..., trustServerCertificate: true)` permite certificados autoassinados: mantém TLS 1.2+, mas ignora validação da cadeia e do hostname. O padrão é `false`. A integração Windows com essa opção passou; a configuração TLS manual por `caFile`/`certificateHostname` permanece **não testada de ponta a ponta com certificado confiável**.
+
 Cliente Flutter/Dart para SQL Server via FFI e FreeTDS 1.5.4 vendorizado. O nome e a versão do pacote são os de `pubspec.yaml` (`sql_server_wrapper`, `0.0.1`). Não há implementação web.
 
 ## Instalação e plataformas
@@ -16,13 +18,13 @@ dependencies:
 import 'package:sql_server_wrapper/sql_server_wrapper.dart';
 ```
 
-O pacote ativo registra somente **Windows x64**. Fontes, binários e scripts das outras plataformas estão arquivados em `todo/`; consulte [TODO.md](TODO.md) para progresso e pendências. Windows ARM64 não foi validado. Consulte `IMPLEMENTACAO_SEGURANCA.md` para a validação SQL ainda pendente; compilar o exemplo não prova todos os comportamentos do driver. Web precisa de um backend/API.
+O pacote ativo registra somente **Windows x64**. Fontes, binários e scripts das outras plataformas estão arquivados em `todo/`; consulte [TODO.md](TODO.md) para progresso e pendências. Windows ARM64 não foi validado. Consulte `IMPLEMENTACAO_SEGURANCA.md` para a cobertura dos testes SQL e as limitações da configuração TLS manual. Web precisa de um backend/API.
 
 As instruções das plataformas adiadas devem ser retomadas junto dos arquivos em `todo/`, antes de voltar a registrá-las no manifesto.
 
 ## Conexão segura
 
-TLS 1.2 ou superior, criptografia obrigatória e validação do certificado são parte da conexão; não há opção `trustServerCertificate` nem fallback para texto claro. Use uma conta com os privilégios necessários ao aplicativo, sem embutir credenciais administrativas no código.
+TLS 1.2 ou superior é obrigatório, sem fallback para texto claro. A validação de certificado é ativada por padrão e pode ser dispensada explicitamente com `trustServerCertificate: true`. Use uma conta com os privilégios necessários ao aplicativo, sem embutir credenciais administrativas no código.
 
 ```dart
 final connection = MssqlConnection(); // sessão independente

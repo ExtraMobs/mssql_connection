@@ -541,7 +541,9 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 		verify_func = tds_verify_certificate_conn;
 	}
 
-	if (!tds_dstr_isempty(&tds->login->cafile)) {
+	/* Explicit wrapper opt-in: retain TLS, skip certificate authentication. */
+	if (!tds_dstr_isempty(&tds->login->cafile)
+	    && strcmp(tds_dstr_cstr(&tds->login->cafile), "trustServerCertificate") != 0) {
 		tls_msg = "loading CA file";
 		if (strcasecmp(tds_dstr_cstr(&tds->login->cafile), "system") == 0)
 			ret = gnutls_certificate_set_x509_system_trust(xcred);
@@ -1041,7 +1043,8 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 	if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION))
 		goto cleanup;
 
-	if (!tds_dstr_isempty(&tds->login->cafile)) {
+	if (!tds_dstr_isempty(&tds->login->cafile)
+	    && strcmp(tds_dstr_cstr(&tds->login->cafile), "trustServerCertificate") != 0) {
 		tls_msg = "loading CA file";
 		if (strcasecmp(tds_dstr_cstr(&tds->login->cafile), "system") == 0)
 			ret = SSL_CTX_set_default_verify_paths(ctx);
@@ -1133,7 +1136,8 @@ tds_ssl_init(TDSSOCKET *tds, bool full)
 		tds_flush_packet(tds);
 
 	/* check certificate hostname */
-	if (!tds_dstr_isempty(&tds->login->cafile) && tds->login->check_ssl_hostname) {
+	if (!tds_dstr_isempty(&tds->login->cafile) && tds->login->check_ssl_hostname
+	    && strcmp(tds_dstr_cstr(&tds->login->cafile), "trustServerCertificate") != 0) {
 		X509 *cert;
 
 		cert =  SSL_get_peer_certificate(con);
