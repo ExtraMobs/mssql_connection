@@ -3,7 +3,7 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:sql_server_wrapper/mssql_connection.dart';
+import 'package:mssql/mssql_connection.dart';
 
 void main() {
   runApp(const MyApp());
@@ -111,7 +111,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
             borderRadius: BorderRadius.circular(20),
             border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
           ),
-          child: child,
+          child: Material(type: MaterialType.transparency, child: child),
         ),
       ),
     );
@@ -162,13 +162,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
     setState(() => _loading = true);
     try {
       final res = await action();
-      final text = res is SqlResponse
-          ? [
-              for (final set in res.resultSets)
-                '${set.columns.join(', ')}\n${set.rows.map((row) => row.join(', ')).join('\n')}',
-              'Affected rows: ${res.totalAffectedRows}',
-            ].join('\n\n')
-          : res.toString();
+      final text = res is MssqlCursor ? await _readCursor(res) : res.toString();
       if (mounted) setState(() => _result = text);
     } catch (e) {
       setState(() => _result = "❌ Error: $e");
@@ -205,6 +199,39 @@ class _MssqlDemoState extends State<MssqlDemo> {
       );
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  Future<String> _readCursor(MssqlCursor cursor) async {
+    try {
+      final output = StringBuffer();
+      do {
+        if (cursor.description != null) {
+          output.writeln(cursor.columns!.join(', '));
+          await for (final row in cursor) {
+            output.writeln(row.values.join(', '));
+          }
+        }
+        if (cursor.rowcount >= 0) {
+          output.writeln('Affected rows: ${cursor.rowcount}');
+        }
+      } while (await cursor.nextset());
+      return output.toString();
+    } finally {
+      await cursor.close();
+    }
+  }
+
+  Future<int> _bulkInsert(
+    String table,
+    List<Map<String, dynamic>> rows, {
+    List<String>? columns,
+  }) async {
+    final cursor = conn.cursor();
+    try {
+      return await cursor.bulkInsert(table, rows, columns: columns);
+    } finally {
+      await cursor.close();
     }
   }
 
@@ -317,7 +344,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
               const SizedBox(height: 16),
               _neuButton(
                 "Get Data",
-                () => _execute(() => conn.getData(queryCtrl.text)),
+                () => _execute(() => conn.execute(queryCtrl.text)),
               ),
             ],
           ),
@@ -333,7 +360,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
               const SizedBox(height: 16),
               _neuButton(
                 "Write Data",
-                () => _execute(() => conn.writeData(writeCtrl.text)),
+                () => _execute(() => conn.execute(writeCtrl.text)),
                 color: Colors.green,
               ),
             ],
@@ -365,7 +392,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
               _neuButton(
                 "Get Data with Params",
                 () => _execute(
-                  () => conn.getDataWithParams(paramQueryCtrl.text, {
+                  () => conn.execute(paramQueryCtrl.text, {
                     for (var e in _params["query"]!.entries)
                       e.key: e.value.text,
                   }),
@@ -393,7 +420,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
               _neuButton(
                 "Write Data with Params",
                 () => _execute(
-                  () => conn.writeDataWithParams(paramExecuteCtrl.text, {
+                  () => conn.execute(paramExecuteCtrl.text, {
                     for (var e in _params["execute"]!.entries)
                       e.key: e.value.text,
                   }),
@@ -601,11 +628,7 @@ class _MssqlDemoState extends State<MssqlDemo> {
                 }).toList();
 
                 _execute(
-                  () => conn.bulkInsert(
-                    tableNameCtrl.text,
-                    rows,
-                    columns: columns,
-                  ),
+                  () => _bulkInsert(tableNameCtrl.text, rows, columns: columns),
                 );
               }),
             ],
@@ -615,54 +638,83 @@ class _MssqlDemoState extends State<MssqlDemo> {
     );
   }
 
-  /// Track transaction state
-  String _txStatus = "No active transaction";
-
   /// Transactions Tab
   Widget _buildTransactionsTab() {
+    final connected = conn.isConnected;
+    final automatic = connected && conn.autocommit;
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Status indicator card
-        _glassCard(
-          child: Row(
-            children: [
-              const Icon(Icons.info, color: Colors.blueAccent),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  "Status: $_txStatus",
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 20),
-
-        _glassCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Run an isolated transaction'),
-              const SizedBox(height: 8),
-              const Text(
-                'The connection is reserved until all statements finish. Success commits; an error rolls back.',
-              ),
-              const SizedBox(height: 12),
-              _neuButton('Run transaction', () {
-                _execute(() async {
-                  final result = await conn.transaction((tx) async {
-                    return tx.getData('SELECT 1 AS transaction_example');
+        SwitchListTile(
+          title: const Text('Autocommit'),
+          value: automatic,
+          onChanged: !connected || _loading
+              ? null
+              : (value) async {
+                  if (value) {
+                    final confirmed = await showDialog<bool>(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        title: const Text('Commit pending changes?'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Cancel'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Commit'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirmed != true || !mounted) return;
+                  }
+                  await _execute(() async {
+                    await conn.setAutocommit(value);
+                    return value
+                        ? 'Autocommit enabled'
+                        : 'Manual commit enabled';
                   });
-                  setState(() => _txStatus = 'Transaction committed');
-                  return result;
-                });
-              }),
-            ],
-          ),
+                },
+        ),
+        Wrap(
+          spacing: 12,
+          children: [
+            ElevatedButton.icon(
+              icon: const Icon(Icons.check),
+              label: const Text('Commit'),
+              onPressed: !connected || automatic || _loading
+                  ? null
+                  : () => _execute(() async {
+                      await conn.commit();
+                      return 'Transaction committed';
+                    }),
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.undo),
+              label: const Text('Rollback'),
+              onPressed: !connected || automatic || _loading
+                  ? null
+                  : () => _execute(() async {
+                      await conn.rollback();
+                      return 'Transaction rolled back';
+                    }),
+            ),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Callback transaction'),
+              onPressed: !automatic || _loading
+                  ? null
+                  : () => _execute(
+                      () => conn.transaction((tx) async {
+                        return _readCursor(
+                          await tx.execute('SELECT 1 AS transaction_example'),
+                        );
+                      }),
+                    ),
+            ),
+          ],
         ),
       ],
     );

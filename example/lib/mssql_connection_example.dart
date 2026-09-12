@@ -1,118 +1,64 @@
 import 'dart:io';
-import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
-import 'package:sql_server_wrapper/mssql_connection.dart';
+import 'package:flutter/foundation.dart';
+import 'package:mssql/mssql_connection.dart';
 
-void main() async {
-  // Enable verbose logs to diagnose native loading/execution
-  // Configure from environment for easy local testing.
-  // Set MSSQL_SERVER (e.g. 192.168.1.10:1433), MSSQL_USER, MSSQL_PASS, MSSQL_DB.
-  debugPrint("Using connection settings:");
-  final server =
-      Platform.environment['MSSQL_SERVER'] ??
-      (throw StateError('Explicit test configuration required'));
-  final username =
-      Platform.environment['MSSQL_USER'] ??
-      (throw StateError('Explicit test configuration required'));
-  final password =
-      Platform.environment['MSSQL_PASSWORD'] ??
-      (throw StateError('Explicit test configuration required'));
-  final database = Platform.environment['MSSQL_DB'] ?? 'master';
-
-  final parts = server.split(':');
-  final ip = parts.isNotEmpty ? parts.first : server;
-  final port = parts.length > 1 ? parts[1] : '1433';
-
-  final conn = MssqlConnection.getInstance();
-  bool ok;
+Future<void> main() async {
+  final env = Platform.environment;
+  String required(String key) =>
+      env[key] ?? (throw StateError('Set $key for a test server'));
+  final db = MssqlConnection();
   try {
-    ok = await conn.connect(
-      ip: ip,
-      port: port,
-      databaseName: database,
-      username: username,
-      password: password,
+    final connected = await db.connect(
+      ip: required('MSSQL_IP'),
+      port: env['MSSQL_PORT'] ?? '1433',
+      databaseName: env['MSSQL_DB'] ?? 'tempdb',
+      username: required('MSSQL_USER'),
+      password: required('MSSQL_PASSWORD'),
+      caFile: env['MSSQL_CA_FILE'] ?? 'system',
+      certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
+      trustServerCertificate: env['MSSQL_TRUST_SERVER_CERTIFICATE'] == 'true',
+      autocommit: false,
     );
-  } catch (e, st) {
-    debugPrint('connect threw: $e\n$st');
-    return;
-  }
-  if (!ok) {
-    debugPrint('Connection failed to $server as $username');
-    return;
-  }
+    if (!connected) throw StateError('Connection failed');
 
-  // Simple query returning a variety of types
-  final q1 = await conn.getData("""
-    SELECT
-      CAST(1 AS int)          AS i32,
-      CAST(1 AS bigint)       AS i64,
-      CAST(1.5 AS real)       AS r32,
-      CAST(1.5 AS float)      AS r64,
-      CAST(1 AS bit)          AS is_true,
-      CAST(N'hello' AS nvarchar(10)) AS nv,
-      CAST(0x010203 AS varbinary(3)) AS vb,
-      CAST(GETDATE() AS datetime) AS dt
-  """);
-  showResponse(q1);
+    final cursor = db.cursor();
+    try {
+      await cursor.execute(
+        'CREATE TABLE #Items (id int PRIMARY KEY, name nvarchar(50))',
+      );
+      Iterable<List<Object?>> items() sync* {
+        yield [1, 'Alice'];
+        yield [2, 'Bob'];
+      }
 
-  // Parameterized query via sp_executesql using automatic type inference
-  final params = {
-    '@id': 42, // int -> int
-    '@when': DateTime.now().toUtc(), // DateTime -> datetime
-    '@blob': Uint8List.fromList([1, 2, 3, 4]), // bytes -> varbinary(max)
-  };
-  final q2 = await conn.getDataWithParams(
-    'SELECT @id AS id, CONVERT(datetime2, @when) AS when_dt2, @blob AS blob',
-    params,
-  );
-  showResponse(q2);
+      await cursor.executemany('INSERT INTO #Items VALUES (?, ?)', items());
+      await db.commit();
 
-  // Basic DDL/DML using write helpers
-  await conn.writeData(
-    'CREATE TABLE #tmp (id INT PRIMARY KEY, name NVARCHAR(50), age INT NULL)',
-  );
-  final q3 = await conn.writeDataWithParams(
-    'INSERT INTO #tmp (id, name) VALUES (@id, @name)',
-    {'@id': 1, '@name': 'Alice'},
-  );
-  showResponse(q3);
-  final q4 = await conn.writeDataWithParams(
-    'INSERT INTO #tmp (id, name) VALUES (@id, @name)',
-    {'@id': 2, '@name': 'Alice'},
-  );
-  showResponse(q4);
-  final q5 = await conn.writeDataWithParams(
-    'UPDATE #tmp SET age = @age WHERE name = @name',
-    {'@id': 2, '@name': 'Alice', '@age': 30},
-  );
-  showResponse(q5);
-  // Verify rows before bulk insert
-  showResponse(await conn.getData('SELECT * FROM #tmp'));
-  // Bulk insert
-  final bulkRows = [
-    {'id': 3, 'name': 'Bob', 'age': 25},
-    {'id': 4, 'name': 'Charlie', 'age': 35},
-  ];
-  final bulkResult = await conn.bulkInsert(
-    '#tmp',
-    bulkRows,
-    columns: ['id', 'name', 'age'],
-  );
-  debugPrint('Bulk insert result: $bulkResult');
-  // Verify rows after bulk insert
-  showResponse(await conn.getData('SELECT * FROM #tmp'));
+      await cursor.execute('SELECT id, name FROM #Items ORDER BY id');
+      await for (final row in cursor) {
+        debugPrint('${row[0]}: ${row['name']}');
+      }
 
-  await conn.disconnect();
-}
+      await cursor.execute('UPDATE #Items SET name=? WHERE id=?', ['Carol', 2]);
+      debugPrint('Updated: ${cursor.rowcount}');
+      await cursor.rollback(); // Alias for db.rollback(), across all cursors.
 
-void showResponse(SqlResponse response) {
-  for (final set in response.resultSets) {
-    debugPrint(set.columns.join(', '));
-    for (final row in set.rows) {
-      debugPrint(row.toString());
+      await cursor.execute('SELECT ? AS instante, ? AS bytes', [
+        DateTime.now().toUtc(),
+        Uint8List.fromList([0, 255]),
+      ]);
+      debugPrint((await cursor.fetchone())!.values.toString());
+      await cursor.cancel();
+      await db.commit();
+    } catch (_) {
+      await cursor.close();
+      if (db.isConnected) await db.rollback();
+      rethrow;
+    } finally {
+      await cursor.close();
     }
+  } finally {
+    await db.close();
   }
-  debugPrint('Affected rows: ${response.totalAffectedRows}');
 }

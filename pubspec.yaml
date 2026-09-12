@@ -1,4 +1,4 @@
-name: sql_server_wrapper
+name: mssql
 description: SQL Server client using Dart FFI and bundled FreeTDS. Requires TLS with certificate verification enabled by default. Windows x64; web is not supported.
 version: 0.0.1
 homepage: https://github.com/ExtraMobs/mssql_connection

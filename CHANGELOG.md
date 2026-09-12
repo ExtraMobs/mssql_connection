@@ -1,6 +1,23 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Breaking
+- Renamed the package from `sql_server_wrapper` to `mssql`. Import `package:mssql/mssql.dart`; existing public class names are unchanged. The internal FreeTDS initialization symbol remains unchanged for binary compatibility.
+- SQL now runs through reusable `MssqlCursor` objects, guided by pyodbc's Cursor/Connection contracts. Removed getData/writeData/WithParams/queryStream and SqlResponse/SqlResultSet. Connection.execute creates and returns a cursor; procedures and bulk insertion belong to the cursor.
+- Autocommit defaults to false. Connection/cursor commit and rollback are supported and affect all cursors in the session. Enabling autocommit commits pending work; connection close rolls back uncommitted work. Callback transactions now require autocommit=true.
+- Cursor creation is synchronous. Direct `await for` fetches incrementally; break or subscription cancellation leaves the cursor open. Close explicitly in finally. Multiple idle/finished cursors coexist; unread results on another cursor reject execution and transaction control.
+
+### Added
+- Positional `?` RPC parameters, lazy executemany, fetchone/fetchmany/fetchall/fetchval, nextset, skipRows, metadata and affected-row counts. Named parameters and direct procedure/bulk calls remain FreeTDS extensions.
+- Focused native and simulated cursor tests, including shared transactions, mode changes and rollback on connection close. Updated examples and migration guidance; no schema migration required.
+
+### Fixed
+- Bulk loads use parameterized INSERTs in manual or explicit transactions to preserve rollback; BCP remains available for eligible autocommit loads without an active transaction.
+- Escaped callback cursors are rejected before queueing; native failures invalidate every cursor in the session.
+
 ## [0.0.1]
 
 ### Added

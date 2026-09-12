@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:sql_server_wrapper/mssql_connection.dart';
+import 'package:mssql/mssql_connection.dart';
 import 'package:test/test.dart';
 
 import 'test_utils.dart';
@@ -82,22 +82,12 @@ void main() {
       final config = TestDbConfig.current;
       final conn = MssqlConnection.getInstance();
       addTearDown(conn.disconnect);
-      expect(
-        await conn.connect(
-          ip: config.ip,
-          port: config.port.toString(),
-          databaseName: config.databaseName,
-          username: config.username,
-          password: config.password,
-        ),
-        isTrue,
+      expect(await config.connect(conn), isTrue);
+      await expectLater(
+        runSql(conn, 'USE [db_does_not_exist_123]'),
+        throwsA(isA<SQLException>()),
       );
-      try {
-        final response = await conn.getData('USE [db_does_not_exist_123]');
-        expect(response.error, isNotNull);
-      } on SQLException {
-        // SQL errors may be returned in SqlResponse or thrown.
-      }
+      expect(conn.isConnected, isFalse);
     }, skip: !runDbTests);
 
     // 4) Username negative case
@@ -119,14 +109,7 @@ void main() {
       final conn = MssqlConnection.getInstance();
       addTearDown(conn.disconnect);
       await expectLater(
-        conn.connect(
-          ip: config.ip,
-          port: config.port.toString(),
-          databaseName: config.databaseName,
-          username: 'definitely-wrong',
-          password: config.password,
-          timeoutInSeconds: 2,
-        ),
+        config.connect(conn, username: 'definitely-wrong', timeoutInSeconds: 2),
         throwsA(isA<SQLException>()),
       );
     }, skip: !runDbTests);
@@ -150,14 +133,7 @@ void main() {
       final conn = MssqlConnection.getInstance();
       addTearDown(conn.disconnect);
       await expectLater(
-        conn.connect(
-          ip: config.ip,
-          port: config.port.toString(),
-          databaseName: config.databaseName,
-          username: config.username,
-          password: 'definitely-wrong',
-          timeoutInSeconds: 2,
-        ),
+        config.connect(conn, password: 'definitely-wrong', timeoutInSeconds: 2),
         throwsA(isA<SQLException>()),
       );
     }, skip: !runDbTests);
@@ -192,6 +168,10 @@ void main() {
   group('Negative cases - SQL execution (syntax/semantics)', () {
     final harness = TempDbHarness();
 
+    setUp(() async {
+      if (!harness.client.isConnected) await harness.reconnect();
+    });
+
     setUpAll(() async {
       await harness.init();
       await harness.recreateTable('''
@@ -206,31 +186,27 @@ void main() {
       await harness.dispose();
     });
 
-    test('invalid SQL syntax throws SQLException (writeData)', () async {
+    test('invalid write SQL throws SQLException', () async {
       await expectLater(
         harness.execute('SELEC 1'),
         throwsA(isA<SQLException>()),
       );
     });
 
-    test('invalid SQL syntax throws SQLException (getData)', () async {
+    test('invalid read SQL throws SQLException', () async {
       await expectLater(
         harness.query('SELET * FROM dbo.NegItems'),
         throwsA(isA<SQLException>()),
       );
     });
 
-    test(
-      'missing parameter in executeParams returns error or throws',
-      () async {
-        try {
-          final out = await harness.executeParams('SELECT @missingParam', {});
-          expect(out.error, isNotNull);
-        } on SQLException {
-          // acceptable: some providers surface this as an exception
-        }
-      },
-    );
+    test('missing parameter in executeParams throws SQLException', () async {
+      await expectLater(
+        harness.executeParams('SELECT @missingParam', {}),
+        throwsA(isA<SQLException>()),
+      );
+      expect(harness.client.isConnected, isFalse);
+    });
 
     test('type overflow via params surfaces error', () async {
       // INT column can't store > INT32 max
@@ -253,7 +229,7 @@ void main() {
         {'id': 2, 'name': 'b'},
       ];
       await expectLater(
-        conn.bulkInsert('dbo.NoSuchTable', rows),
+        runBulk(conn, 'dbo.NoSuchTable', rows),
         throwsA(isA<SQLException>()),
       );
     });
@@ -262,7 +238,8 @@ void main() {
       final c = harness.client;
       await expectLater(
         c.transaction((tx) async {
-          await tx.writeData(
+          await runSql(
+            tx,
             "INSERT INTO dbo.NegItems (id, wrong_name) VALUES (1, N'x')",
           );
         }),
@@ -319,20 +296,20 @@ void main() {
 
   group('Offline API negative behavior (no DB)', () {
     test(
-      'getData without connect throws StateError when no saved params',
+      'query without connect throws StateError without reconnecting',
       () async {
         final c = MssqlConnection.getInstance();
         // Ensure disconnected
         await c.disconnect();
-        await expectLater(c.getData('SELECT 1'), throwsA(isA<StateError>()));
+        await expectLater(runSql(c, 'SELECT 1'), throwsA(isA<StateError>()));
       },
     );
 
-    test('writeDataWithParams without connect throws StateError', () async {
+    test('parameterized write without connect throws StateError', () async {
       final c = MssqlConnection.getInstance();
       await c.disconnect();
       await expectLater(
-        c.writeDataWithParams('SELECT @p', {'p': 1}),
+        runSql(c, 'SELECT @p', {'p': 1}),
         throwsA(isA<StateError>()),
       );
     });

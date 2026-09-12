@@ -1,356 +1,268 @@
-# Exemplos de uso
+# Exemplos: Cursor e Transações
 
-API atual do pacote `sql_server_wrapper` (`0.0.1`). Os trechos Dart com `await` devem ficar dentro de uma função `async`. Eles usam a conexão `db` abaixo; tabelas e procedures devem existir no seu banco.
+O pacote é `mssql` (`0.0.1`), conforme `pubspec.yaml`. Os exemplos seguem o modelo de [Cursor](https://github.com/mkleehammer/pyodbc/wiki/Cursor) e [Connection](https://github.com/mkleehammer/pyodbc/wiki/Connection) do pyodbc, adaptado aos `Future`/`Stream` do Dart. Consulte [README.md](README.md) para instalação, TLS e limitações de plataforma.
 
-O pacote ativo registra somente Windows x64. As outras plataformas estão arquivadas em `todo/`, com progresso em [TODO.md](TODO.md). A integração SQL Windows passou com `trustServerCertificate: true`; a configuração manual de CA/hostname ainda não foi testada de ponta a ponta com certificado confiável. Consulte [IMPLEMENTACAO_SEGURANCA.md](IMPLEMENTACAO_SEGURANCA.md).
+## Exemplo Completo
 
-## Conectar
+Este exemplo usa somente uma tabela temporária da sessão. Credenciais são obrigatórias no ambiente e não são impressas.
 
 ```dart
-import 'package:sql_server_wrapper/mssql_connection.dart';
 import 'dart:io';
+import 'package:mssql/mssql.dart';
 
-final MssqlConnection db = MssqlConnection(); // sessão independente
-final env = Platform.environment; // configure no ambiente; não embuta senhas
+Future<void> main() async {
+  final env = Platform.environment;
+  String required(String key) =>
+      env[key] ?? (throw StateError('Configure $key'));
+  final db = MssqlConnection();
+  try {
+    final connected = await db.connect(
+      ip: required('MSSQL_IP'),
+      port: env['MSSQL_PORT'] ?? '1433',
+      databaseName: env['MSSQL_DB'] ?? 'tempdb',
+      username: required('MSSQL_USER'),
+      password: required('MSSQL_PASSWORD'),
+      caFile: env['MSSQL_CA_FILE'] ?? 'system',
+      certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
+      trustServerCertificate:
+          env['MSSQL_TRUST_SERVER_CERTIFICATE'] == 'true',
+      autocommit: false, // também é o padrão quando omitido
+    );
+    if (!connected) throw StateError('Falha ao conectar');
 
-try {
-  final bool conectado = await db.connect(
-    ip: env['MSSQL_IP']!,
-    port: env['MSSQL_PORT'] ?? '1433', // String
-    databaseName: env['MSSQL_DB'] ?? 'tempdb',
-    username: env['MSSQL_USER']!,
-    password: env['MSSQL_PASSWORD']!,
-    timeoutInSeconds: 15, // int; timeout de conexão/login
-    queryTimeoutSeconds: 30, // timeout nativo das consultas
-    caFile: env['MSSQL_CA_FILE'] ?? 'system',
-    trustServerCertificate: false, // true aceita autoassinados; mantém TLS
-    certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
-    maxResultRows: 100000,
-    maxResultBytes: 64 * 1024 * 1024,
-  );
-  if (!conectado) throw StateError('Entrada inválida ou servidor inacessível.');
-} on SQLException catch (e) {
-  // Inclui a operação e os diagnósticos nativos disponíveis.
-  // Registre em local protegido; mensagens podem identificar usuário/servidor.
-  print(e.message);
-  rethrow; // não prossiga com consultas após a falha
-}
-```
+    final cursor = db.cursor(); // não precisa de await
+    try {
+      await cursor.execute(
+        'CREATE TABLE #Pessoas (id int PRIMARY KEY, nome nvarchar(100))',
+      );
+      await cursor.executemany(
+        'INSERT INTO #Pessoas (id, nome) VALUES (?, ?)',
+        [[1, 'Ana'], [2, 'Bruno'], [3, 'Carla']],
+      );
+      await db.commit();
 
-`connect` retorna `Future<bool>`: após `await`, `true` indica conexão estabelecida. Entradas inválidas ou falha na sondagem TCP retornam `false`. Falhas nativas na inicialização/login lançam `SQLException` com os diagnósticos dos callbacks, mesmo com logs desligados; se não houver diagnóstico, a mensagem identifica a operação que falhou. A exceção é lançada após o retorno nativo, nunca dentro do callback FFI. Requer SQL Server acessível e FreeTDS com suas dependências nativas disponíveis.
+      await cursor.execute(
+        'SELECT id, nome FROM #Pessoas WHERE id >= ? ORDER BY id',
+        [1],
+      );
+      await for (final row in cursor) {
+        print('${row[0]}: ${row['nome']}');
+      }
 
-TLS 1.2 ou superior é obrigatório. Por padrão, `trustServerCertificate: false` valida cadeia e hostname. Com `true`, aceita certificados autoassinados e ignora essas duas verificações, mantendo a criptografia. Nesse modo não é necessário fornecer CA/hostname; use os valores padrão desses argumentos.
-
-**Configuração TLS manual (`caFile`/`certificateHostname`): não testada de ponta a ponta com certificado confiável.** `caFile` aceita PEM absoluto ou `system` (confiança do OpenSSL, não necessariamente do Windows). Ao conectar por IP, `certificateHostname` informa o nome esperado no certificado. O pacote não carrega `.env` por conta própria. A integração Windows com `MSSQL_TRUST_SERVER_CERTIFICATE=true` passou no servidor de testes.
-
-`MssqlConnection.getInstance()` continua disponível para uma sessão compartilhada. As operações são serializadas; chamadas FFI bloqueiam o isolate proprietário. Não use `Isolate.run` para distribuir chamadas: a inicialização nativa rejeita outro proprietário dos callbacks.
-
-No aplicativo Flutter Windows, a DLL é carregada do bundle. Para execução Dart independente, configure `NativeLoader.libraryDirectory` com o caminho absoluto de `windows/Libraries/bin` antes da primeira conexão. A busca não usa o diretório de trabalho nem `PATH`; a DLL precisa conter as extensões atuais de segurança.
-
-## Métodos e retornos
-
-| Método | Tipo retornado | Valor após `await` |
-|---|---|---|
-| `connect(...)` | `Future<bool>` | Estado do estabelecimento da conexão |
-| `getData(sql)` | `Future<SqlResponse>` | Resultados do SQL |
-| `getDataWithParams(sql, params)` | `Future<SqlResponse>` | Resultados do SQL parametrizado |
-| `writeData(sql)` | `Future<SqlResponse>` | Resultados e contagem de linhas afetadas |
-| `writeDataWithParams(sql, params)` | `Future<SqlResponse>` | Resultados e contagem do SQL parametrizado |
-| `executeProcedure(nome, params)` | `Future<SqlResponse>` | Resultados da procedure |
-| `bulkInsert(tabela, linhas, ...)` | `Future<int>` | Quantidade inserida reportada pelo driver |
-| `transaction<T>((tx) async { ... })` | `Future<T>` | Valor retornado pelo callback após commit |
-| `disconnect()` | `Future<bool>` | Resultado do encerramento pela API |
-| `isConnected` | `bool` | Propriedade síncrona; não usa `await` |
-
-`getData` e `writeData` chamam a mesma execução internamente. Os nomes expressam a intenção; não restringem o SQL a leitura ou escrita. O mesmo vale para as versões `WithParams`.
-
-## Estrutura de `SqlResponse`
-
-| Campo | Tipo | Conteúdo |
-|---|---|---|
-| `resultSets` | `List<SqlResultSet>` | Conjuntos retornados com colunas |
-| `totalAffectedRows` | `int` | Soma das contagens reportadas pelo FreeTDS |
-| `error` | `String?` | Campo mantido no modelo; o cliente atual lança exceções em falhas de coleta |
-| `resultSets[i].columns` | `List<String>` | Nomes das colunas, em ordem |
-| `resultSets[i].rows` | `List<List<dynamic>>` | Linhas; cada posição corresponde a uma coluna |
-
-O retorno é um objeto Dart, sem necessidade de `jsonDecode`. As células são `dynamic`, não modelos tipados nem mapas por nome de coluna. Para contar linhas de um SELECT, use `rows.length`; `totalAffectedRows` soma somente contagens positivas do driver e depende dos comandos e de `SET NOCOUNT`.
-
-Falhas nativas e de coleta lançam exceções e invalidam a sessão; não retornam resultados parciais como sucesso. O helper abaixo é defensivo para objetos que preencham o campo opcional `error`; ele não substitui o tratamento de exceções:
-
-```dart
-SqlResponse conferir(SqlResponse response) {
-  final String? erro = response.error;
-  if (erro != null) throw SQLException(erro);
-  return response;
-}
-```
-
-## SELECT: consultar linhas
-
-```dart
-final SqlResponse resultado = conferir(await db.getDataWithParams(
-  'SELECT Id, Nome FROM dbo.Usuarios WHERE Id = @id',
-  <String, dynamic>{'id': 1},
-));
-
-for (final SqlResultSet conjunto in resultado.resultSets) {
-  for (final List<dynamic> linha in conjunto.rows) {
-    final int id = linha[0] as int; // supondo coluna SQL INT NOT NULL
-    final String? nome = linha[1] as String?;
-    print('$id: $nome');
+      await cursor.execute(
+        'UPDATE #Pessoas SET nome=? WHERE id=?', ['Beatriz', 2],
+      );
+      print('Linhas afetadas: ${cursor.rowcount}');
+      await db.rollback(); // desfaz a atualização, não os INSERTs confirmados
+    } catch (_) {
+      await cursor.close();
+      if (db.isConnected) await db.rollback();
+      rethrow;
+    } finally {
+      await cursor.close();
+    }
+  } finally {
+    await db.close(); // desfaz qualquer transação ainda não confirmada
   }
 }
 ```
 
-Exemplo de conteúdo: `columns = ['Id', 'Nome']`, `rows = [[1, 'Ana']]`. Sem registros, `rows` fica vazia. Não acesse `rows.first` sem conferir.
+## Loop e Fetches
 
-Para SQL fixo sem parâmetros:
+Nos trechos seguintes, `db` é uma conexão já aberta. O cursor é o objeto percorrido: use `await for`, não um `for` síncrono. Não é necessário chamar `fetchone()` manualmente dentro do loop.
 
 ```dart
-final SqlResponse resultado = conferir(await db.getData(
-  'SELECT TOP (10) Id, Nome FROM dbo.Usuarios ORDER BY Id',
-));
+final cursor = await db.execute('SELECT id, nome FROM dbo.Pessoas ORDER BY id');
+try {
+  await for (final row in cursor) {
+    print(row['nome']);
+    break;
+  }
+  // break NÃO fecha o cursor. Este fetch continua da próxima linha.
+  final proxima = await cursor.fetchone();
+  print(proxima?.values);
+} finally {
+  await cursor.close();
+}
+await db.rollback(); // encerra eventual transação de leitura
 ```
 
-## INSERT: inserir uma linha
+`db.execute()` cria um cursor e retorna `Future<MssqlCursor>`; `cursor.execute()` reutiliza o cursor e retorna o próprio objeto. Ambos aceitam SELECT, INSERT, UPDATE, DELETE, DDL e EXEC. Executar novamente no mesmo cursor descarta os resultados anteriores.
 
 ```dart
-final SqlResponse resultado = conferir(await db.writeDataWithParams(
-  'INSERT INTO dbo.Usuarios (Nome) VALUES (@nome)',
-  {'nome': 'Ana'},
-));
-final int afetadas = resultado.totalAffectedRows;
-```
-
-O retorno não é o ID criado. Para receber o ID de uma coluna `IDENTITY`, peça-o no SQL:
-
-```dart
-final SqlResponse resultado = conferir(await db.writeDataWithParams(
-  'INSERT INTO dbo.Usuarios (Nome) OUTPUT INSERTED.Id VALUES (@nome)',
-  {'nome': 'Ana'},
-));
-final int id = resultado.resultSets.first.rows.first[0] as int;
-```
-
-Esse acesso pressupõe um INSERT bem-sucedido de uma linha com `Id` do tipo SQL `INT`.
-
-## UPDATE: alterar linhas existentes
-
-```dart
-final SqlResponse resultado = conferir(await db.writeDataWithParams(
-  'UPDATE dbo.Usuarios SET Nome = @nome WHERE Id = @id',
-  {'nome': 'Maria', 'id': 1},
-));
-final int afetadas = resultado.totalAffectedRows;
-```
-
-Retorna `SqlResponse`, não `bool`. Contagem zero pode significar que nenhum registro correspondeu ao filtro; não é, por si só, um erro. Sem `WHERE`, o UPDATE alcança todas as linhas.
-
-## DELETE: remover linhas
-
-```dart
-final SqlResponse resultado = conferir(await db.writeDataWithParams(
-  'DELETE FROM dbo.Usuarios WHERE Id = @id',
-  {'id': 1},
-));
-final int afetadas = resultado.totalAffectedRows;
-```
-
-Remove registros e mantém a tabela. Sem `WHERE`, alcança todas as linhas. Normalmente não retorna linhas; `OUTPUT DELETED.Id` permite recebê-las em `resultSets`. UPDATE também aceita `OUTPUT INSERTED...`/`DELETED...`.
-
-## CREATE, ALTER, DROP e TRUNCATE
-
-```dart
-final SqlResponse resultado = conferir(await db.writeData(
-  'CREATE TABLE #Itens (Id INT NOT NULL, Nome NVARCHAR(100) NULL)',
-));
-```
-
-| SQL | Diferença |
-|---|---|
-| `CREATE TABLE` | Cria a estrutura |
-| `ALTER TABLE` | Modifica a estrutura |
-| `DELETE ... WHERE ...` | Remove registros selecionados |
-| `TRUNCATE TABLE` | Esvazia a tabela inteira, sem `WHERE`, com restrições próprias do SQL Server |
-| `DROP TABLE` | Remove a tabela e seus dados |
-
-Todos podem ser enviados por `writeData` e retornam `Future<SqlResponse>`. Comandos de estrutura normalmente não têm linhas de resultado; sua contagem não é um indicador útil de sucesso.
-
-## Parâmetros e tipos de entrada
-
-`WithParams` recebe `String` e `Map<String, dynamic>` e executa via `sp_executesql`. Use placeholders como `@id`; as chaves do mapa aceitam `'id'` ou `'@id'`. Parâmetros representam valores, não nomes de tabela/coluna nem trechos SQL. Não concatene entrada do usuário no SQL.
-
-| Valor Dart | Tipo SQL inferido em `WithParams` |
-|---|---|
-| `int` | `int`, ou `bigint` fora do intervalo de 32 bits |
-| `double` finito | `float`; NaN e infinito são rejeitados |
-| `bool` | `bit` |
-| `String` | `nvarchar(max)`; buffer UTF-8 e parâmetro RPC Unicode |
-| `DateTime` | `datetimeoffset(7)` binário, preservando instante, offset e microssegundos |
-| `Uint8List` | `varbinary(max)` |
-| `null` | `nvarchar(max)` com valor nulo |
-
-O codec do cliente é UTF-8 em todos os caminhos de texto e é configurado no login do FreeTDS. O driver faz a conversão para a codificação do SQL Server; colunas `VARCHAR` continuam limitadas pela collation. Prefira `NVARCHAR` para texto Unicode e `N'...'` em literais SQL fixos. O envio de UTF-8 não muda a collation do banco.
-
-O módulo `lib/src/ffi/freetds_text.dart` mantém `Utf8Codec()` para os bytes e o identificador nativo `UTF-8` para o login. Não substitua esse identificador por `Utf8Codec().name`: o Dart retorna `utf-8`, alias não reconhecido pela tabela sensível a maiúsculas do FreeTDS vendorizado. Strings Dart usam unidades UTF-16; a conversão padrão para UTF-8 não introduz NUL entre letras. A conversão para UTF-16 do protocolo é responsabilidade do FreeTDS, não do chamador.
-
-Passe strings normalmente; não faça pré-conversão nem remova zeros:
-
-```dart
-final String texto = 'João 中文 🙂';
-final SqlResponse resposta = conferir(await db.getDataWithParams(
-  'SELECT @texto AS Texto',
-  {'texto': texto},
-));
-final String recebido = resposta.resultSets.single.rows.single.single as String;
-assert(recebido == texto);
-```
-
-Resultados inválidos em UTF-8 lançam `FormatException`, sem tentar Latin-1 ou adivinhar UTF-16. Valores parametrizados preservam `\x00` reais; SQL, nomes e credenciais em C strings rejeitam NUL para evitar truncamento. Dados já corrompidos no banco não são reparados automaticamente. Diagnósticos nativos usam o mesmo UTF-8, com substituição de bytes inválidos por U+FFFD para não lançar através de callbacks.
-
-`DateTime` é codificado com instante UTC e offset original, dentro do intervalo suportado pelo SQL Server. A conversão para `datetime`, `datetime2` e outros destinos deve ser validada quanto a precisão, fuso e `DATEFORMAT`. Outros objetos passam por `toString()`; prefira os tipos acima. Nomes de parâmetros são validados e duplicatas como `id`/`@ID` são rejeitadas; `WithParams` aceita até 2098 parâmetros do usuário.
-
-## Tipos das células retornadas
-
-| Tipo SQL comum | Valor Dart atual |
-|---|---|
-| Inteiros | `int` |
-| `bit` | `bool` |
-| `real`, `float` | `double` |
-| `money`, `smallmoney`, `decimal`, `numeric` | `String` decimal exata, sem conversão para `double` |
-| Texto | `String` |
-| `datetime`, `smalldatetime` | `String` em formato ISO, não `DateTime` |
-| `date`, `time`, `datetime2`, `datetimeoffset` | `String`; tipos modernos preservam até sete casas e `datetimeoffset` inclui offset |
-| Binários (`binary`, `varbinary`, `image`) | `String` Base64, não `Uint8List` |
-| `NULL` | `null` |
-
-Texto vazio retorna `''`; binário vazio retorna `''` em Base64; SQL NULL retorna `null`. Essa distinção também é preservada nos parâmetros RPC. Conversão decimal que falha lança `FormatException`, em vez de retornar bytes. Outros tipos podem usar conversões do FreeTDS e fallbacks; confira o tipo antes de fazer casts.
-
-```dart
-import 'dart:convert';
-import 'dart:typed_data';
-
-// Se a célula binária não for nula:
-final Uint8List bytes = base64Decode(valorBase64);
-// Se a célula contiver uma data ISO válida:
-final DateTime data = DateTime.parse(valorData);
-```
-
-`valorBase64` e `valorData` representam strings obtidas das células correspondentes.
-
-Datas SQL sem offset são civis: `DateTime.parse` interpreta uma string sem offset no fuso local. O Dart preserva microssegundos, portanto converter uma string com sete casas para `DateTime` perde a precisão adicional. Preserve a string quando precisar da representação exata.
-
-## Stored procedure
-
-```dart
-final SqlResponse resultado = conferir(await db.executeProcedure(
-  'dbo.BuscarUsuario',
-  {'Id': 1},
-));
-```
-
-A procedure deve existir e aceitar os parâmetros informados. A chamada usa RPC direto. Os SELECTs da procedure aparecem em `resultSets`; escritas contribuem para a contagem reportada. A API atual não oferece campos específicos para parâmetros `OUTPUT` ou código `RETURN` da procedure.
-
-## Vários conjuntos de resultado
-
-```dart
-final SqlResponse resultado = conferir(await db.getData(
-  'SELECT 1 AS Numero; SELECT 2 AS OutroNumero;',
-));
-for (final SqlResultSet conjunto in resultado.resultSets) {
-  print(conjunto.columns);
-  print(conjunto.rows);
+final cursor = db.cursor();
+try {
+  await cursor.execute('SELECT id, nome FROM dbo.Pessoas ORDER BY id');
+  cursor.arraysize = 100;
+  while (true) {
+    final lote = await cursor.fetchmany();
+    if (lote.isEmpty) break;
+    for (final row in lote) {
+      print(row.values);
+    }
+  }
+} finally {
+  await cursor.close();
 }
 ```
 
-Cada SELECT produz seu conjunto. Comandos sem colunas não geram `SqlResultSet`.
+`fetchone()` retorna `null` no fim; `fetchmany([size])` retorna `[]`. `fetchall()` materializa apenas as linhas restantes do resultado atual. Todos compartilham posição com o loop. `fetchval()` retorna a primeira coluna da próxima linha, ou `null` para SQL NULL/fim. `skipRows(n)` descarta até `n` linhas; `Stream.skip(n)` continua sendo a operação de stream do Dart.
 
-## Inserção em massa
+As linhas são `SqlRow`: `row[0]`, `row['nome']`, `row.values`, `row.columns`. Valores e nomes são imutáveis e permanecem válidos depois de fechar o cursor. Nomes são exatos; duplicados usam a primeira coluna.
+
+## Vários Resultados e Procedures
 
 ```dart
-final int inseridas = await db.bulkInsert(
-  'dbo.ItensCarga',
-  <Map<String, dynamic>>[
-    {'Codigo': 10, 'Nome': 'Ana'},
-    {'Codigo': 11, 'Nome': 'Maria'},
-  ],
-  columns: ['Codigo', 'Nome'],
-  batchSize: 1000,
-);
+final cursor = db.cursor();
+try {
+  await cursor.execute('SELECT 1 AS primeiro; SELECT 2 AS segundo');
+  do {
+    if (cursor.description != null) {
+      print(cursor.columns);
+      await for (final row in cursor) {
+        print(row.values);
+      }
+    }
+    print('Contagem: ${cursor.rowcount}');
+  } while (await cursor.nextset());
+} finally {
+  await cursor.close();
+}
 ```
 
-Use uma tabela de carga existente com colunas e tipos compatíveis. Sem `columns`, usa as chaves da primeira linha. Cargas contendo texto usam INSERT parametrizado, com as colunas indicadas por nome.
+`nextset()` descarta linhas não lidas do resultado atual. Fetches não avançam automaticamente entre resultados. `description` contém apenas `SqlColumn.name` e o `typeCode` DB-Lib, não os sete campos ODBC; fica `null` para resultados sem colunas. SELECT vazio mantém seus metadados. `rowcount` pode ser `-1` (desconhecido), especialmente antes de terminar um SELECT. Leia-o antes de avançar para outro resultado.
 
-Retorna `Future<int>`, sem `SqlResponse` ou IDs. Texto, datas, valores nulos, objetos convertidos em texto e tabelas temporárias `#` usam um INSERT parametrizado por linha. Esse caminho compartilha o codec das outras operações, pode ser mais lento e não usa `batchSize`.
+```dart
+final cursor = db.cursor();
+try {
+  await cursor.execute('EXEC dbo.BuscarPessoa @id=?', [42]);
+  do {
+    if (cursor.description != null) {
+      await for (final row in cursor) {
+        print(row.values);
+      }
+    }
+  } while (await cursor.nextset());
+} finally {
+  await cursor.close();
+}
+```
 
-FreeTDS BCP é usado apenas em cargas numéricas/binárias não nulas e homogêneas para tabelas comuns. O cliente verifica todas as linhas, promove inteiros para 64 bits quando necessário e compara as colunas com os metadados da tabela. Ordem diferente ou seleção parcial de colunas usa INSERT parametrizado por nome. Binário vazio também usa esse fallback. `batchSize` controla somente os lotes BCP. Lista vazia retorna zero após validar conexão, nome da tabela e tamanho de lote. Linhas/lotes anteriores podem permanecer gravados após uma falha; envolva `bulkInsert` em `transaction` quando precisar de atomicidade.
+Também existe `cursor.executeProcedure('dbo.BuscarPessoa', {'id': 42})`, extensão de RPC direto. Procedures que escrevem participam da transação da conexão; confirme-as explicitamente no modo manual.
 
-## Transações
+## Parâmetros e Generators
+
+Use uma `List` com os valores dos marcadores `?`, sem interpolação de dados no SQL. Aspas, colchetes e comentários não contam como marcadores. Nomes de tabelas/colunas não são valores parametrizáveis.
+
+```dart
+Iterable<List<Object?>> pessoas() sync* {
+  yield [1, 'Ana'];
+  yield [2, 'Bruno'];
+}
+
+final cursor = db.cursor();
+try {
+  await cursor.executemany(
+    'INSERT INTO dbo.Pessoas (id, nome) VALUES (?, ?)', pessoas(),
+  );
+  await db.commit();
+} catch (_) {
+  await cursor.close();
+  if (db.isConnected) await db.rollback();
+  rethrow;
+} finally {
+  await cursor.close();
+}
+```
+
+`executemany` consome o iterable progressivamente, sem convertê-lo inteiro em lista, mas executa as chamadas nativas no isolate proprietário. Retorna `Future<void>` e deixa `rowcount=-1`; não agrega resultados. Com autocommit=true, linhas anteriores podem permanecer confirmadas se uma posterior falhar.
+
+Mapas nomeados continuam disponíveis como extensão: `await cursor.execute('SELECT @id AS id', {'id': 42})`. Não misture lista posicional e mapa na mesma chamada. Nomes duplicados como `id`/`@ID` são rejeitados.
+
+Strings usam UTF-8/Unicode, inclusive NUL em valores parametrizados; SQL/nomes/credenciais rejeitam NUL. `''` é diferente de `null`. `DateTime` usa `datetimeoffset(7)`, preservando instante, offset e microssegundos. Datas lidas são strings ISO; datas sem offset não recebem `Z`. MONEY/DECIMAL retornam strings exatas. Envie binários como `Uint8List`; binários lidos são Base64.
+
+## Transações Compartilhadas
+
+`autocommit` pertence à conexão, assim como a transação. Não há transação privada por cursor nem `beginTransaction()` obrigatório.
+
+```dart
+final primeiro = db.cursor();
+final segundo = db.cursor();
+try {
+  await primeiro.execute('UPDATE dbo.Contas SET saldo=saldo-? WHERE id=?', [10, 1]);
+  await segundo.execute('UPDATE dbo.Contas SET saldo=saldo+? WHERE id=?', [10, 2]);
+  await segundo.commit(); // confirma AMBOS; equivalente a db.commit()
+} catch (_) {
+  await primeiro.close();
+  await segundo.close();
+  if (db.isConnected) await db.rollback();
+  rethrow;
+} finally {
+  await primeiro.close();
+  await segundo.close();
+}
+```
+
+`await db.setAutocommit(true)` **confirma trabalho pendente** antes de ativar a confirmação por instrução. `await db.setAutocommit(false)` volta ao modo manual. Leia `db.autocommit` para consultar o modo. CREATE/DROP DATABASE exigem autocommit=true. Não altere `IMPLICIT_TRANSACTIONS` manualmente por SQL: use a API para manter o estado coerente.
+
+Fechar um cursor não confirma nem desfaz escritas. `await db.close()` (ou `disconnect()`) desfaz transações pendentes e invalida todos os cursores. SELECT sobre tabelas também pode iniciar uma transação: encerre-a quando terminar a unidade de trabalho. Falhas nativas invalidam a sessão; não há reconexão/repetição automática.
+
+A extensão de callback abaixo requer uma conexão aberta com `autocommit: true`:
 
 ```dart
 await db.transaction((tx) async {
-  conferir(await tx.writeDataWithParams(
-    'UPDATE dbo.Usuarios SET Nome = @nome WHERE Id = @id',
-    {'nome': 'Ana', 'id': 1},
-  ));
-  conferir(await tx.writeDataWithParams(
-    'UPDATE dbo.Usuarios SET Nome = @nome WHERE Id = @id',
-    {'nome': 'Maria', 'id': 2},
-  ));
-});
+  final cursor = tx.cursor();
+  await cursor.execute('UPDATE dbo.Contas SET saldo=saldo-? WHERE id=?', [10, 1]);
+  await cursor.execute('UPDATE dbo.Contas SET saldo=saldo+? WHERE id=?', [10, 2]);
+}); // sucesso confirma; exceção desfaz; cursores do callback fecham ao sair
 ```
 
-`transaction` reserva a sessão durante todo o callback, inclusive seus `await`. Operações externas aguardam; sucesso faz commit e uma exceção provoca rollback se a sessão ainda estiver conectada. Falha nativa fecha/invalida a sessão. Aguarde todas as operações dentro do callback e deixe os erros propagarem. Transações aninhadas, substituição da sessão dentro da transação e operações de callbacks atrasados após seu término são rejeitadas.
+O callback reserva a fila inclusive entre `await`s. Operações externas aguardam; aninhamento e commit/rollback manual dentro dele são rejeitados. Não use seus cursores fora do escopo. No modo manual, consumidores da mesma conexão participam da mesma transação; prefira `MssqlConnection()` independente para trabalhos independentes.
 
-`beginTransaction`, `commit` e `rollback` estão obsoletos e lançam `UnsupportedError`. Migre para o callback; comandos manuais `BEGIN TRAN` enviados por SQL livre não adquirem essa reserva.
-
-## Erros e encerramento
+## Bulk Insert
 
 ```dart
+final cursor = db.cursor();
 try {
-  final SqlResponse resultado = conferir(await db.getData('SELECT 1 AS Ok'));
-  print(resultado.resultSets.first.rows);
-} on SQLException catch (e) {
-  print(e.message);
-} on FormatException catch (e) {
-  print(e); // por exemplo: resultado com bytes inválidos em UTF-8
-} on StateError catch (e) {
-  print(e); // por exemplo: operação antes de conectar
+  final inseridas = await cursor.bulkInsert(
+    'dbo.Pessoas',
+    [{'id': 10, 'nome': 'Ana'}, {'id': 11, 'nome': 'Bruno'}],
+    columns: ['id', 'nome'],
+    batchSize: 1000,
+  );
+  await db.commit();
+  print(inseridas);
+} catch (_) {
+  await cursor.close();
+  if (db.isConnected) await db.rollback();
+  rethrow;
 } finally {
-  final bool encerrado = await db.disconnect();
-  print(encerrado);
+  await cursor.close();
 }
 ```
 
-Outras exceções podem ocorrer, como `ArgumentError` por entrada inválida ou falha ao carregar a DLL. Limites de linhas/bytes excedidos lançam erro e invalidam a sessão. `disconnect()` remove e fecha o cliente; não há parâmetros salvos para reconexão automática.
+É uma extensão FreeTDS, com retorno `Future<int>`. No modo manual ou em transação explícita, usa INSERT parametrizado por linha para preservar rollback. Texto, datas, NULL, objetos convertidos em texto e tabelas `#` também usam esse caminho, que não agrupa instruções com `batchSize` e pode ser mais lento. BCP exige autocommit, ausência de transação ativa e dados numéricos/binários não nulos na ordem completa das colunas.
 
-`db.isConnected` consulta o estado local, sem testar a rede. Após falha nativa ou `disconnect()`, chame `connect()` explicitamente. Operações sem sessão conectada lançam `StateError`; nenhuma transação é reconectada ou repetida automaticamente.
+## Limites e Encerramento
 
-Os callbacks do FreeTDS armazenam diagnósticos e também os enviam ao logger quando habilitado. `SQLException` na inicialização/login independe do logger. A captura é feita durante cada chamada nativa, inclusive quando a conexão falha antes de existir um identificador válido para o chamador.
+Múltiplos cursores ociosos/concluídos podem coexistir. Há somente um comando com resultados pendentes por conexão, sem MARS. Antes de outro cursor executar, de commit/rollback ou de mudar o modo, consuma **todos** os resultados, cancele ou feche o cursor ativo. Caso contrário recebe `StateError`, sem invalidar a sessão. Reutilizar o próprio cursor descarta seu resultado anterior.
 
-## Validar os exemplos e codecs
+Ao consumir EOF, o leitor verifica apenas os metadados do próximo resultado. Se não houver outro, libera a sessão sem exigir fechar o cursor; se houver, use `nextset()` ou descarte-o. `cursor.cancel()` preserva o cursor. `close()` é idempotente. Uma pausa no stream suspende fetches; `break` não fecha o cursor. Não use consumidores concorrentes no mesmo cursor.
 
-Testes locais, sem SQL Server:
+`maxResultRows` (100.000) e `maxResultBytes` (64 MiB) contam dados decodificados por execução, somados entre fetches e resultados; não medem todos os buffers nativos. Ajuste-os em `connect()` para volumes maiores. Ultrapassá-los, SQL inválido ou falha nativa/de decodificação fecha a sessão; linhas anteriores podem já ter sido entregues. Não trate uma leitura interrompida como completa. Uma falha de comunicação durante commit pode ter resultado incerto.
+
+Todas as chamadas DB-Lib do processo devem ficar no mesmo isolate proprietário. As chamadas FFI bloqueiam esse isolate, apesar dos retornos `Future`/`Stream`. Use um isolate dedicado quando necessário e não exponha o mesmo cursor a consumidores simultâneos.
+
+## Migração e Testes
+
+`getData`/`writeData`/`WithParams`/`queryStream` e `SqlResponse`/`SqlResultSet` saíram da API. Troque por `cursor.execute`, fetches/loop, `nextset` e `rowcount`. Procedures/bulk pertencem ao cursor. Feche o cursor explicitamente e revise todas as escritas para commit/rollback ou autocommit=true. Não há alteração de schema. Antes de trocar de versão, encerre conscientemente transações pendentes e feche as sessões.
 
 ```sh
-dart test test/freetds_text_test.dart
+flutter analyze
+dart test test/mssql_cursor_test.dart test/freetds_text_test.dart test/test_utils_test.dart
 dart test test/native_library_test.dart
-flutter analyze --no-pub
-```
-
-O primeiro teste usa DB-Lib simulado. O segundo carrega a DLL Windows e valida ABI, callbacks e rejeição de servidor sem TLS, sem acessar SQL Server. Execute-os em invocações separadas por causa do proprietário dos callbacks. Testes históricos do decoder antigo não provam o comportamento atual.
-
-Para validar SQL, RPC, procedures, tipos e transações em homologação, defina `MSSQL_IP`, `MSSQL_USER` e `MSSQL_PASSWORD`; opcionais: `MSSQL_PORT` (1433), `MSSQL_DB` (tempdb), `MSSQL_CA_FILE` e `MSSQL_CERTIFICATE_HOSTNAME`. Em Dart independente no Windows, defina também `MSSQL_NATIVE_DIR` com o caminho absoluto de `windows/Libraries/bin`:
-
-Para optar explicitamente por confiar no certificado apresentado, defina `MSSQL_TRUST_SERVER_CERTIFICATE=true`. Sem essa variável, a validação do certificado permanece ativada.
-
-```sh
+dart test test/mssql_cursor_integration_test.dart
 dart test test/freetds_text_integration_test.dart
 ```
 
-Esse teste usa tabela e procedure temporárias de sessão, compara texto Unicode, texto longo e NUL intencional sem limpeza e encerra a conexão ao terminar. Sem as variáveis obrigatórias, é ignorado. O pacote e esse teste não carregam `.env` automaticamente: carregue suas chaves no ambiente antes de executar. Se usar `IP`, `PORT`, `DB`, `LOGIN` e `PWD` no arquivo, mapeie-as respectivamente para as cinco variáveis `MSSQL_*` acima. Não versione o arquivo nem exponha os valores nos logs.
-
-Os helpers `runWithClientAndTempDb` e `TempDbHarness`, além da suíte `mssql_connection_api_test.dart`, criam e removem bancos. Exigem `RUN_DB_TESTS=1`, `MSSQL_SERVER=host:porta`, `MSSQL_USER` e `MSSQL_PASSWORD` (ou `MSSQL_PASS`). Use somente servidor destinado a testes. Os testes negativos de autenticação também exigem `RUN_DB_TESTS=1`, usam `TestDbConfig` (`MSSQL_IP`, `MSSQL_PORT`, `MSSQL_DB`, `MSSQL_USER`, `MSSQL_PASSWORD`) e fazem tentativas de login inválido; considere a política de bloqueio de contas antes de executá-los.
-
-Os helpers de resultados dos testes recebem `SqlResponse`, não JSON: `parseRows` transforma um único conjunto em mapas por coluna; `affectedCount` lê `totalAffectedRows`. Ambos verificam `response.error`. São utilitários da suíte, não métodos da API pública. Preserve a execução serial configurada em `dart_test.yaml`; testes de desempenho não fazem parte da verificação padrão.
+Suítes nativas devem executar separadamente. Integrações usam servidor de testes explicitamente configurado; sem `MSSQL_IP`, `MSSQL_USER`, `MSSQL_PASSWORD`, são ignoradas. Preserve testes seriais na VM. `test/cursor_results.dart` materializa snapshots apenas para fixtures de testes, não para a API pública. Os demais helpers de banco e `tool/integration_db_lifecycle.dart` podem criar/remover bancos; não os execute contra produção nem rode desempenho como verificação padrão.

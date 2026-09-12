@@ -1,4 +1,4 @@
-#include "include/sql_server_wrapper/mssql_connection_plugin.h"
+#include "include/mssql/mssql_connection_plugin.h"
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>

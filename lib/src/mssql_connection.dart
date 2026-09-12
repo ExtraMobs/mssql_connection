@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'mssql_client.dart';
-import 'sql_response.dart';
-export 'sql_response.dart';
+export 'sql_row.dart';
+export 'mssql_client.dart' show MssqlCursor;
 
 /// Owns a session. getInstance preserves the original shared-instance entry point.
 class MssqlConnection {
@@ -13,7 +13,9 @@ class MssqlConnection {
   Future<void> _tail = Future.value();
   final Object _transactionKey = Object();
   Object? _activeTransaction;
+  final _transactionCursors = <MssqlCursor>{};
   bool get isConnected => _client?.isConnected == true;
+  bool get autocommit => _connected.autocommit;
 
   Future<T> _schedule<T>(
     FutureOr<T> Function() action, {
@@ -26,7 +28,9 @@ class MssqlConnection {
       }
       if (lifecycle) {
         return Future.error(
-          StateError('Cannot replace a session during a transaction'),
+          StateError(
+            'Cannot change the session or transaction mode inside transaction(callback)',
+          ),
         );
       }
       return Future.sync(action);
@@ -60,6 +64,7 @@ class MssqlConnection {
     bool trustServerCertificate = false,
     int maxResultRows = 100000,
     int maxResultBytes = 64 * 1024 * 1024,
+    bool autocommit = false,
   }) => _schedule(() async {
     final host = ip.trim(), user = username.trim();
     final portNumber = int.tryParse(port.trim());
@@ -90,12 +95,13 @@ class MssqlConnection {
       queryTimeoutSeconds: queryTimeoutSeconds,
       maxResultRows: maxResultRows,
       maxResultBytes: maxResultBytes,
+      autocommit: autocommit,
     );
     try {
       if (!await candidate.connect(loginTimeoutSeconds: timeoutInSeconds)) {
         return false;
       }
-      if (dbName != null) await candidate.execute('USE $dbName');
+      if (dbName != null) await _control(candidate, 'USE $dbName');
       _client = candidate;
       return true;
     } catch (_) {
@@ -104,34 +110,52 @@ class MssqlConnection {
     }
   }, lifecycle: true);
 
-  Future<SqlResponse> getData(String query) =>
-      _schedule(() => _connected.execute(query));
-  Future<SqlResponse> writeData(String query) => getData(query);
-  Future<SqlResponse> getDataWithParams(
-    String query,
-    Map<String, dynamic> params,
-  ) => _schedule(() => _connected.executeParams(query, params));
-  Future<SqlResponse> writeDataWithParams(
-    String query,
-    Map<String, dynamic> params,
-  ) => getDataWithParams(query, params);
-  Future<SqlResponse> executeProcedure(
-    String name,
-    Map<String, dynamic> params,
-  ) => _schedule(() => _connected.executeProcedure(name, params));
-  Future<int> bulkInsert(
-    String name,
-    List<Map<String, dynamic>> rows, {
-    List<String>? columns,
-    int batchSize = 1000,
-  }) => _schedule(
-    () => _connected.bulkInsert(
-      name,
-      rows,
-      columns: columns,
-      batchSize: batchSize,
-    ),
-  );
+  /// Creates an idle cursor. Execute and fetch on it; close it in finally.
+  MssqlCursor cursor() {
+    final token = Zone.current[_transactionKey];
+    _validateCursorTransaction(token);
+    final current = _connected.cursor(
+      validate: () => _validateCursorTransaction(token),
+      schedule: _schedule,
+      validateTransactionControl: () {
+        if (Zone.current[_transactionKey] != null) {
+          throw StateError(
+            'Cannot commit or roll back inside transaction(callback)',
+          );
+        }
+      },
+    );
+    if (token != null) _transactionCursors.add(current);
+    return current;
+  }
+
+  void _validateCursorTransaction(Object? token) {
+    if (token != null &&
+        (!identical(token, _activeTransaction) ||
+            !identical(token, Zone.current[_transactionKey]))) {
+      throw StateError('Cursor must be used in its active transaction');
+    }
+  }
+
+  /// pyodbc-style convenience: creates, executes and returns a new cursor.
+  Future<MssqlCursor> execute(String sql, [Object? parameters]) async {
+    final current = cursor();
+    try {
+      return await current.execute(sql, parameters);
+    } catch (_) {
+      await current.close();
+      rethrow;
+    }
+  }
+
+  Future<void> _control(MssqlClient client, String sql) async {
+    final current = await client.execute(sql);
+    try {
+      while (await current.nextset()) {}
+    } finally {
+      await current.close();
+    }
+  }
 
   Future<bool> disconnect() => _schedule(() async {
     final client = _client;
@@ -140,31 +164,61 @@ class MssqlConnection {
     return true;
   }, lifecycle: true);
 
+  /// Closes the session and invalidates all its cursors.
+  Future<void> close() async {
+    await disconnect();
+  }
+
+  /// Applies to all cursors on this connection. Fetch/cancel pending results first.
+  Future<void> commit() =>
+      _schedule(() => _connected.commit(), lifecycle: true);
+
+  Future<void> rollback() =>
+      _schedule(() => _connected.rollback(), lifecycle: true);
+
+  /// Enabling autocommit commits pending work. Async equivalent of assigning
+  /// pyodbc's autocommit property; state changes only after the native call succeeds.
+  Future<void> setAutocommit(bool value) =>
+      _schedule(() => _connected.setAutocommit(value), lifecycle: true);
+
   /// Reserves the session for the entire callback, including its awaits.
   /// Calls outside its Zone wait; callbacks used after completion are rejected.
-  /// Errors close/roll back the session; statements are never retried implicitly.
+  /// Requires autocommit=true. Errors roll back; native failures close the session.
   Future<T> transaction<T>(Future<T> Function(MssqlConnection tx) action) {
     if (Zone.current[_transactionKey] != null) {
       return Future.error(StateError('Nested transactions are not supported'));
     }
     return _schedule(() async {
       final client = _connected;
+      if (!client.autocommit) {
+        throw StateError(
+          'transaction(callback) requires autocommit=true; use commit()/rollback() in manual mode',
+        );
+      }
       final token = Object();
-      await client.execute('BEGIN TRAN');
+      await _control(client, 'BEGIN TRAN');
       _activeTransaction = token;
       try {
-        final result = await runZoned(
-          () => action(this),
-          zoneValues: {_transactionKey: token},
-        );
-        _activeTransaction = null;
-        await client.execute('COMMIT');
+        final T result;
+        try {
+          result = await runZoned(
+            () => action(this),
+            zoneValues: {_transactionKey: token},
+          );
+        } finally {
+          _activeTransaction = null;
+          for (final cursor in _transactionCursors.toList()) {
+            await cursor.close();
+          }
+          _transactionCursors.clear();
+        }
+        await _control(client, 'COMMIT');
         return result;
       } catch (_) {
         _activeTransaction = null;
         if (client.isConnected) {
           try {
-            await client.execute('ROLLBACK');
+            await _control(client, 'ROLLBACK');
           } catch (_) {
             await client.close();
           }
@@ -173,16 +227,4 @@ class MssqlConnection {
       }
     });
   }
-
-  @Deprecated(
-    'Use transaction((tx) async { ... }); manual shared transactions have no owner',
-  )
-  Future<void> beginTransaction() =>
-      Future.error(UnsupportedError('Use transaction((tx) async { ... })'));
-  @Deprecated('transaction commits automatically on success')
-  Future<void> commit() =>
-      Future.error(UnsupportedError('Use transaction((tx) async { ... })'));
-  @Deprecated('transaction rolls back automatically on error')
-  Future<void> rollback() =>
-      Future.error(UnsupportedError('Use transaction((tx) async { ... })'));
 }

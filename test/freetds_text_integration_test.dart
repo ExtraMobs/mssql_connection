@@ -1,9 +1,10 @@
+import 'cursor_results.dart';
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:sql_server_wrapper/mssql_connection.dart';
-import 'package:sql_server_wrapper/src/native_logger.dart';
+import 'package:mssql/mssql_connection.dart';
+import 'package:mssql/src/native_logger.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -26,12 +27,12 @@ void main() {
       const value = 'João ação € “aspas” 中文 مرحبا 🙂';
       final longValue = List.filled(5000, 'é').join();
 
-      SqlResponse checked(SqlResponse response) {
+      ResultSnapshot checked(ResultSnapshot response) {
         if (response.error != null) throw SQLException(response.error!);
         return response;
       }
 
-      void expectValue(SqlResponse response, String expected) {
+      void expectValue(ResultSnapshot response, String expected) {
         final set = checked(response).resultSets.single;
         expect(set.rows.single.single, expected);
       }
@@ -42,6 +43,7 @@ void main() {
             ip: env['MSSQL_IP']!,
             port: env['MSSQL_PORT'] ?? '1433',
             databaseName: env['MSSQL_DB'] ?? 'tempdb',
+            autocommit: true,
             username: env['MSSQL_USER']!,
             password: env['MSSQL_PASSWORD']!,
             caFile: env['MSSQL_CA_FILE'] ?? 'system',
@@ -52,81 +54,86 @@ void main() {
           isTrue,
         );
 
-        final direct = await db.getData("SELECT N'$value' AS [Descrição]");
+        final direct = await runSql(db, "SELECT N'$value' AS [Descrição]");
         expectValue(direct, value);
         expect(direct.resultSets.single.columns, ['Descrição']);
 
         checked(
-          await db.writeData(
+          await runSql(
+            db,
             'CREATE TABLE #CodecText (Id INT NOT NULL, Texto NVARCHAR(MAX))',
           ),
         );
         checked(
-          await db.writeData(
+          await runSql(
+            db,
             'CREATE PROCEDURE #CodecEcho @texto NVARCHAR(MAX) AS SELECT @texto',
           ),
         );
 
         for (final text in [value, longValue, 'A\u0000BC', '']) {
+          expectValue(await runSql(db, 'SELECT @texto', {'texto': text}), text);
           expectValue(
-            await db.getDataWithParams('SELECT @texto', {'texto': text}),
-            text,
-          );
-          expectValue(
-            await db.executeProcedure('#CodecEcho', {'texto': text}),
+            await runProcedure(db, '#CodecEcho', {'texto': text}),
             text,
           );
           checked(
-            await db.writeDataWithParams(
+            await runSql(
+              db,
               'INSERT INTO #CodecText (Id, Texto) VALUES (@id, @texto)',
               {'id': 1, 'texto': text},
             ),
           );
           expectValue(
-            await db.getData('SELECT Texto FROM #CodecText WHERE Id = 1'),
+            await runSql(db, 'SELECT Texto FROM #CodecText WHERE Id = 1'),
             text,
           );
           checked(
-            await db.writeDataWithParams(
+            await runSql(
+              db,
               'UPDATE #CodecText SET Texto = @texto WHERE Id = @id',
               {'id': 1, 'texto': value},
             ),
           );
           expectValue(
-            await db.getData('SELECT Texto FROM #CodecText WHERE Id = 1'),
+            await runSql(db, 'SELECT Texto FROM #CodecText WHERE Id = 1'),
             value,
           );
-          checked(await db.writeData('DELETE FROM #CodecText'));
+          checked(await runSql(db, 'DELETE FROM #CodecText'));
 
-          await db.bulkInsert('#CodecText', [
+          await runBulk(db, '#CodecText', [
             {'Id': 2, 'Texto': text},
           ]);
           expectValue(
-            await db.getData('SELECT Texto FROM #CodecText WHERE Id = 2'),
+            await runSql(db, 'SELECT Texto FROM #CodecText WHERE Id = 2'),
             text,
           );
-          checked(await db.writeData('DELETE FROM #CodecText'));
+          checked(await runSql(db, 'DELETE FROM #CodecText'));
         }
 
-        await db.writeData(
+        await runSql(
+          db,
           'CREATE PROCEDURE #EmptyValues @a nvarchar(max), @b varbinary(max), @c nvarchar(max) AS SELECT @a, @b, @c',
         );
         final emptyParams = {'a': '', 'b': Uint8List(0), 'c': null};
         expect(
-          (await db.getDataWithParams(
+          (await runSql(
+            db,
             'SELECT @a, @b, @c',
             emptyParams,
           )).resultSets.single.rows.single,
           ['', '', null],
         );
         expect(
-          (await db.executeProcedure(
+          (await runProcedure(
+            db,
             '#EmptyValues',
             emptyParams,
           )).resultSets.single.rows.single,
           ['', '', null],
         );
-        final money = await db.getData(
+        final money = await runSql(
+          db,
           "SELECT CAST(1 AS money), CAST(-0.0001 AS money), CAST(12345678901234567890.123456789012345678 AS decimal(38,18))",
         );
         expect(money.resultSets.single.rows.single, [
@@ -135,18 +142,20 @@ void main() {
           '12345678901234567890.123456789012345678',
         ]);
 
-        await db.writeData(
+        await runSql(
+          db,
           'CREATE PROCEDURE #DateEcho @v datetimeoffset(7) AS SELECT CONVERT(datetime,@v), CONVERT(datetime2(7),@v), @v',
         );
         final instant = DateTime.utc(2024, 2, 29, 12, 34, 56, 123, 456);
         for (final format in ['mdy', 'dmy', 'ymd', 'ydm', 'myd', 'dym']) {
-          await db.writeData('SET DATEFORMAT $format');
+          await runSql(db, 'SET DATEFORMAT $format');
           for (final response in [
-            await db.getDataWithParams(
+            await runSql(
+              db,
               'SELECT CONVERT(datetime,@v), CONVERT(datetime2(7),@v), @v',
               {'v': instant},
             ),
-            await db.executeProcedure('#DateEcho', {'v': instant}),
+            await runProcedure(db, '#DateEcho', {'v': instant}),
           ]) {
             final row = response.resultSets.single.rows.single;
             expect(row[0], '2024-02-29T12:34:56.123333');
@@ -155,17 +164,17 @@ void main() {
           }
         }
 
-        await db.writeData('CREATE TABLE #Tx (id int)');
+        await runSql(db, 'CREATE TABLE #Tx (id int)');
         final entered = Completer<void>();
         final release = Completer<void>();
         final transaction = db.transaction((tx) async {
-          await tx.writeData('INSERT INTO #Tx VALUES (1)');
+          await runSql(tx, 'INSERT INTO #Tx VALUES (1)');
           entered.complete();
           await release.future;
         });
         await entered.future;
         var outsideFinished = false;
-        final outside = db.getData('SELECT COUNT(*) FROM #Tx').then((r) {
+        final outside = runSql(db, 'SELECT COUNT(*) FROM #Tx').then((r) {
           outsideFinished = true;
           return r;
         });
@@ -179,13 +188,14 @@ void main() {
         expect((await outside).resultSets.single.rows.single.single, 1);
         await expectLater(
           db.transaction((tx) async {
-            await tx.writeData('INSERT INTO #Tx VALUES (2)');
+            await runSql(tx, 'INSERT INTO #Tx VALUES (2)');
             throw StateError('Application rollback');
           }),
           throwsStateError,
         );
         expect(
-          (await db.getData(
+          (await runSql(
+            db,
             'SELECT COUNT(*) FROM #Tx',
           )).resultSets.single.rows.single.single,
           1,

@@ -159,6 +159,12 @@ typedef _dbresultsDart = int Function(Pointer<DBPROCESS>);
 typedef _dbnextrowC = Int32 Function(Pointer<DBPROCESS>);
 typedef _dbnextrowDart = int Function(Pointer<DBPROCESS>);
 
+/// Cancel all results, or discard only the remaining rows of the current result.
+typedef _dbcancelC = Int32 Function(Pointer<DBPROCESS>);
+typedef _dbcancelDart = int Function(Pointer<DBPROCESS>);
+typedef _dbdeadC = Uint8 Function(Pointer<DBPROCESS>);
+typedef _dbdeadDart = int Function(Pointer<DBPROCESS>);
+
 /// C: int dbnumcols(DBPROCESS*) — Column count for current result set
 typedef _dbnumcolsC = Int32 Function(Pointer<DBPROCESS>);
 typedef _dbnumcolsDart = int Function(Pointer<DBPROCESS>);
@@ -434,6 +440,9 @@ class DBLib {
   late final _dbsqlexecDart dbsqlexec;
   late final _dbresultsDart dbresults;
   late final _dbnextrowDart dbnextrow;
+  late final _dbcancelDart dbcancel;
+  late final _dbcancelDart dbcanquery;
+  late final _dbdeadDart dbdead;
   late final _dbnumcolsDart dbnumcols;
   late final _dbcolnameDart dbcolname;
   late final _dbcoltypeDart dbcoltype;
@@ -507,6 +516,9 @@ class DBLib {
     dbnextrow = _lib.lookupFunction<_dbnextrowC, _dbnextrowDart>(
       'dbnextrow',
     ); // Fetch next row
+    dbcancel = _lib.lookupFunction<_dbcancelC, _dbcancelDart>('dbcancel');
+    dbcanquery = _lib.lookupFunction<_dbcancelC, _dbcancelDart>('dbcanquery');
+    dbdead = _lib.lookupFunction<_dbdeadC, _dbdeadDart>('dbdead');
     dbnumcols = _lib.lookupFunction<_dbnumcolsC, _dbnumcolsDart>(
       'dbnumcols',
     ); // Column count

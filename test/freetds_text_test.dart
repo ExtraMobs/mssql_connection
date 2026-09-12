@@ -1,14 +1,15 @@
+import 'cursor_results.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
-import 'package:sql_server_wrapper/src/ffi/freetds_bindings.dart';
-import 'package:sql_server_wrapper/src/ffi/freetds_text.dart';
-import 'package:sql_server_wrapper/src/mssql_client.dart';
-import 'package:sql_server_wrapper/src/native_logger.dart';
-import 'package:sql_server_wrapper/src/sql_exception.dart';
+import 'package:mssql/src/ffi/freetds_bindings.dart';
+import 'package:mssql/src/ffi/freetds_text.dart';
+import 'package:mssql/src/mssql_client.dart';
+import 'package:mssql/src/native_logger.dart';
+import 'package:mssql/src/sql_exception.dart';
 import 'package:test/test.dart';
 
 const sample = 'João ação € “aspas” 中文 مرحبا 🙂';
@@ -65,7 +66,7 @@ void main() {
     final db = _RecordingDb();
     final client = _clientWith(db);
     await client.connect();
-    await client.executeProcedure('dbo.Values', {
+    await procedureOnClient(client, 'dbo.Values', {
       'a': '',
       'b': Uint8List(0),
       'c': null,
@@ -93,11 +94,11 @@ void main() {
       final client = _clientWith(db);
       await client.connect();
       await expectLater(
-        client.executeParams('SELECT @p', {'p': 1, '@P': 2}),
+        executeOnClient(client, 'SELECT @p', {'p': 1, '@P': 2}),
         throwsArgumentError,
       );
       await expectLater(
-        client.executeParams('SELECT @p', {'p int);--': 1}),
+        executeOnClient(client, 'SELECT @p', {'p int);--': 1}),
         throwsArgumentError,
       );
       expect(db.procedures, isEmpty);
@@ -131,7 +132,7 @@ void main() {
       final client = _clientWith(db);
       await client.connect();
       await expectLater(
-        client.execute('SELECT TOP (0) * FROM T'),
+        executeOnClient(client, 'SELECT TOP (0) * FROM T'),
         throwsA(isA<SQLException>()),
       );
       expect(client.isConnected, isFalse);
@@ -246,28 +247,28 @@ void main() {
     await client.connect();
 
     final sql = "SELECT N'$sample' AS [Descrição]";
-    await client.execute(sql);
+    await executeOnClient(client, sql);
     expect(db.commands.last, utf8.encode(sql));
     const ddl = 'CREATE TABLE #Ação (Id INT)';
-    await client.execute(ddl);
+    await executeOnClient(client, ddl);
     expect(db.commands.last, utf8.encode(ddl));
 
     for (final value in [sample, 'A\u0000BC', List.filled(5000, 'é').join()]) {
-      await client.executeParams('SELECT @texto AS [Descrição]', {
+      await executeOnClient(client, 'SELECT @texto AS [Descrição]', {
         'texto': value,
       });
       expect(db.params.last.type, SYBNTEXT);
       expect(db.params.last.bytes, utf8.encode(value));
       expect(db.params.last.length, utf8.encode(value).length);
 
-      await client.executeProcedure('dbo.Operação', {'texto': value});
+      await procedureOnClient(client, 'dbo.Operação', {'texto': value});
       expect(db.procedures.last, '[dbo].[Operação]');
       expect(db.params.last.type, SYBNTEXT);
       expect(db.params.last.bytes, utf8.encode(value));
 
       // The native BCP path is deliberately absent from this fake: text must use RPC.
       expect(
-        await client.bulkInsert('dbo.Textos', [
+        await bulkOnClient(client, 'dbo.Textos', [
           {'Descrição': value},
         ]),
         1,
@@ -283,7 +284,7 @@ void main() {
     final client = _clientWith(db);
     await client.connect();
     final bytes = Uint8List.fromList([0, 0xff, 0x80]);
-    await client.executeProcedure('dbo.Values', {
+    await procedureOnClient(client, 'dbo.Values', {
       'integer': 42,
       'bigint': 1 << 40,
       'boolean': true,
@@ -308,7 +309,7 @@ void main() {
     final client = _clientWith(db);
     await client.connect();
     expect(
-      await client.bulkInsert('dbo.Values', [
+      await bulkOnClient(client, 'dbo.Values', [
         {
           'Id': 1,
           'Bytes': Uint8List.fromList([0, 255]),
@@ -326,6 +327,32 @@ void main() {
   });
 
   test(
+    'manual and explicit transactions keep numeric bulk inside RPC',
+    () async {
+      for (final automatic in [false, true]) {
+        final db = _RecordingDb()..transactionDepth = automatic ? 1 : 0;
+        final client = _clientWith(db, autocommit: automatic);
+        await client.connect();
+        try {
+          expect(
+            await bulkOnClient(client, 'dbo.Values', [
+              {
+                'Id': 1,
+                'Bytes': Uint8List.fromList([255]),
+              },
+            ]),
+            1,
+          );
+          expect(db.bcpRows, 0);
+          expect(db.procedures, ['sp_executesql']);
+        } finally {
+          await client.close();
+        }
+      }
+    },
+  );
+
+  test(
     'reordered columns and quoted temporary tables use named INSERTs',
     () async {
       for (final table in ['dbo.Values', '[#Values]']) {
@@ -335,7 +362,7 @@ void main() {
         final columns = table.startsWith('dbo')
             ? ['Bytes', 'Id']
             : ['Id', 'Bytes'];
-        await client.bulkInsert(table, [
+        await bulkOnClient(client, table, [
           {
             'Id': 1,
             'Bytes': Uint8List.fromList([255]),
@@ -449,16 +476,20 @@ void main() {
 }
 
 // Exercise the internal client without loading DLLs or contacting a server.
-MssqlClient _clientWith(DBLib db) => MssqlClient(
+MssqlClient _clientWith(DBLib db, {bool autocommit = true}) => MssqlClient(
   server: 'codec-test',
   username: 'user',
   password: 'test',
   dbLib: db,
+  autocommit: autocommit,
 );
 
 class _RecordingDb implements DBLib {
   final _arena = Arena();
   bool metadata = false;
+  bool transactionCount = false;
+  bool transactionRowRead = false;
+  int transactionDepth = 0;
   int freedLogins = 0;
   bool closed = false;
   int rowResult = NO_MORE_ROWS;
@@ -556,6 +587,8 @@ class _RecordingDb implements DBLib {
       },
       #dbcmd => (dynamic process, Pointer<Utf8> text) {
         metadata = text.toDartString().startsWith('SELECT TOP (0)');
+        transactionCount = text.toDartString() == 'SELECT @@TRANCOUNT';
+        transactionRowRead = false;
         commands.add(text.cast<Uint8>().asTypedList(text.length).toList());
         return SUCCEED;
       },
@@ -564,13 +597,30 @@ class _RecordingDb implements DBLib {
         _result = !_result;
         return _result ? SUCCEED : NO_MORE_RESULTS;
       },
-      #dbnumcols => (dynamic process) => metadata ? 2 : 0,
+      #dbnumcols =>
+        (dynamic process) => transactionCount ? 1 : (metadata ? 2 : 0),
       #dbcoltype => (dynamic process, dynamic col) => SYBINT4,
       #dbcolname => (dynamic process, int col) => toNativeFreeTdsText(
         ['Id', 'Bytes'][col - 1],
         allocator: _arena,
       ),
-      #dbnextrow => (dynamic process) => rowResult,
+      #dbnextrow => (dynamic process) {
+        if (transactionCount && !transactionRowRead) {
+          transactionRowRead = true;
+          return REG_ROW;
+        }
+        return rowResult;
+      },
+      #dbdatlen => (dynamic process, dynamic col) => 4,
+      #dbdata =>
+        (dynamic process, dynamic col) =>
+            (_arena<Int32>()..value = transactionDepth).cast<Uint8>(),
+      #dbcanquery => (dynamic process) => SUCCEED,
+      #dbcancel => (dynamic process) {
+        _result = false;
+        return SUCCEED;
+      },
+      #dbdead => (dynamic process) => 0,
       #dbcount => (dynamic process) => 1,
       #bcp_init =>
         (

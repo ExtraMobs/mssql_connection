@@ -3,11 +3,11 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:isolate';
 import 'package:ffi/ffi.dart';
-import 'package:sql_server_wrapper/src/ffi/freetds_bindings.dart';
-import 'package:sql_server_wrapper/src/ffi/freetds_text.dart';
-import 'package:sql_server_wrapper/src/native_loader.dart';
-import 'package:sql_server_wrapper/src/mssql_client.dart';
-import 'package:sql_server_wrapper/src/sql_exception.dart';
+import 'package:mssql/src/ffi/freetds_bindings.dart';
+import 'package:mssql/src/ffi/freetds_text.dart';
+import 'package:mssql/src/native_loader.dart';
+import 'package:mssql/src/mssql_client.dart';
+import 'package:mssql/src/sql_exception.dart';
 import 'package:test/test.dart';
 
 // Run in a separate dart test invocation: DB-Lib callbacks have one owning isolate.

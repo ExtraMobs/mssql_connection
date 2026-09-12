@@ -1,13 +1,16 @@
+export 'cursor_results.dart';
+import 'cursor_results.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:sql_server_wrapper/mssql_connection.dart';
+import 'package:mssql/mssql_connection.dart';
 
 void requireTempDbConfig() {
   final env = Platform.environment;
   if (env['RUN_DB_TESTS'] != '1' ||
-      env['MSSQL_SERVER']?.isNotEmpty != true ||
+      (env['MSSQL_SERVER']?.isNotEmpty != true &&
+          env['MSSQL_IP']?.isNotEmpty != true) ||
       env['MSSQL_USER']?.isNotEmpty != true ||
       ![
         env['MSSQL_PASS'],
@@ -15,7 +18,7 @@ void requireTempDbConfig() {
       ].any((p) => p?.isNotEmpty == true)) {
     throw StateError(
       'Temporary database tests require RUN_DB_TESTS=1, '
-      'MSSQL_SERVER, MSSQL_USER and MSSQL_PASSWORD (or MSSQL_PASS).',
+      'MSSQL_SERVER (or MSSQL_IP), MSSQL_USER and MSSQL_PASSWORD (or MSSQL_PASS).',
     );
   }
 }
@@ -29,57 +32,24 @@ String _uniqueDbName([String prefix = 'Test']) {
 Future<void> runWithClientAndTempDb(
   Future<void> Function(MssqlConnection client, String dbName) body,
 ) async {
-  requireTempDbConfig();
-  final server = Platform.environment['MSSQL_SERVER']!;
-  final username = Platform.environment['MSSQL_USER']!;
-  final password =
-      Platform.environment['MSSQL_PASS'] ??
-      Platform.environment['MSSQL_PASSWORD']!;
-
-  // Parse server into ip and port (default 1433)
-  final parts = server.split(':');
-  final ip = parts.isNotEmpty ? parts.first : '127.0.0.1';
-  final port = parts.length > 1 ? parts[1] : '1433';
-
-  final client = MssqlConnection.getInstance();
-  final ok = await client.connect(
-    ip: ip,
-    port: port,
-    databaseName: 'master',
-    username: username,
-    password: password,
-  );
-  if (!ok) {
-    throw StateError('Failed to connect to $server as $username');
-  }
-
-  final dbName = _uniqueDbName('Test');
+  final harness = TempDbHarness();
   try {
-    await client.execute('CREATE DATABASE [$dbName]');
-    await client.execute('USE [$dbName]');
-    await body(client, dbName);
+    await harness.init();
+    await body(harness.client, harness.dbName);
   } finally {
-    try {
-      await client.execute('USE master');
-      await client.execute(
-        'ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE',
-      );
-      await client.execute('DROP DATABASE [$dbName]');
-    } catch (_) {}
-    await client.disconnect();
+    await harness.dispose();
   }
 }
 
-// Compat layer so tests can call client.execute/query/executeParams with
-// a MssqlConnection instance.
-extension _TestClientCompat on MssqlConnection {
-  Future<SqlResponse> execute(String sql) => writeData(sql);
-  Future<SqlResponse> query(String sql) => getData(sql);
-  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) =>
-      writeDataWithParams(sql, params);
+extension _TestQueries on MssqlConnection {
+  Future<ResultSnapshot> query(String sql) => runSql(this, sql);
+  Future<ResultSnapshot> executeParams(
+    String sql,
+    Map<String, dynamic> params,
+  ) => runSql(this, sql, params);
 }
 
-List<Map<String, dynamic>> parseRows(SqlResponse response) {
+List<Map<String, dynamic>> parseRows(ResultSnapshot response) {
   if (response.error != null) throw SQLException(response.error!);
   if (response.resultSets.isEmpty) return [];
   final set = response.resultSets.single;
@@ -89,7 +59,7 @@ List<Map<String, dynamic>> parseRows(SqlResponse response) {
   ];
 }
 
-int affectedCount(SqlResponse response) {
+int affectedCount(ResultSnapshot response) {
   if (response.error != null) throw SQLException(response.error!);
   return response.totalAffectedRows;
 }
@@ -100,58 +70,55 @@ int affectedCount(SqlResponse response) {
 /// when scaling up to dozens of cases per mode. Use setUpAll/tearDownAll in
 /// your test group to initialize and dispose this harness once per group.
 class TempDbHarness {
-  late final MssqlConnection client;
-  late final String dbName;
+  final MssqlConnection client = MssqlConnection();
+  final String dbName = _uniqueDbName('Bulk');
+  bool _created = false;
 
   Future<void> init() async {
-    client = MssqlConnection.getInstance();
     await reconnect(database: 'master');
-    dbName = _uniqueDbName('Bulk');
-    await client.execute('CREATE DATABASE [$dbName]');
-    await client.execute('USE [$dbName]');
+    await runSql(client, 'CREATE DATABASE [$dbName]');
+    _created = true;
+    await runSql(client, 'USE [$dbName]');
   }
 
-  Future<void> reconnect({String? database}) async {
-    requireTempDbConfig();
-    final server = Platform.environment['MSSQL_SERVER']!;
-    final username = Platform.environment['MSSQL_USER']!;
-    final password =
-        Platform.environment['MSSQL_PASS'] ??
-        Platform.environment['MSSQL_PASSWORD']!;
-    final parts = server.split(':');
-    final ip = parts.isNotEmpty ? parts.first : '127.0.0.1';
-    final port = parts.length > 1 ? parts[1] : '1433';
-
-    final ok = await client.connect(
-      ip: ip,
-      port: port,
-      databaseName: database ?? dbName,
-      username: username,
-      password: password,
-      caFile: Platform.environment['MSSQL_CA_FILE'] ?? 'system',
-      certificateHostname: Platform.environment['MSSQL_CERTIFICATE_HOSTNAME'],
+  Future<void> reconnect({
+    String? database,
+    int maxResultRows = 100000,
+    int maxResultBytes = 64 * 1024 * 1024,
+  }) async {
+    final ok = await TestDbConfig.current.connect(
+      client,
+      database: database ?? dbName,
+      maxResultRows: maxResultRows,
+      maxResultBytes: maxResultBytes,
     );
     if (!ok) {
-      throw StateError('Failed to connect to $server as $username');
+      throw StateError('Failed to connect to the configured test server');
     }
   }
 
   Future<void> dispose() async {
     try {
+      if (!_created) return;
       if (!client.isConnected) await reconnect(database: 'master');
-      await client.execute('USE master');
-      await client.execute(
+      await runSql(client, 'USE master');
+      await runSql(
+        client,
         'ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE',
       );
-      await client.execute('DROP DATABASE [$dbName]');
-    } catch (_) {}
-    await client.disconnect();
+      await runSql(client, 'DROP DATABASE [$dbName]');
+      _created = false;
+    } finally {
+      await client.disconnect();
+    }
   }
 
-  Future<SqlResponse> execute(String sql) => client.execute(sql);
-  Future<SqlResponse> query(String sql) => client.query(sql);
-  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) =>
-      client.executeParams(sql, params);
+  Future<ResultSnapshot> execute(String sql) => runSql(client, sql);
+  Future<ResultSnapshot> query(String sql) => client.query(sql);
+  Future<ResultSnapshot> executeParams(
+    String sql,
+    Map<String, dynamic> params,
+  ) => client.executeParams(sql, params);
 
   /// Drops the table if it exists and recreates it using the provided CREATE TABLE statement.
   Future<void> recreateTable(String createTableSql) async {
@@ -192,20 +159,54 @@ class TestDbConfig {
     required this.password,
   });
 
-  static TestDbConfig fromEnv() {
-    final env = Platform.environment;
+  static TestDbConfig fromEnv([Map<String, String>? environment]) {
+    final env = environment ?? Platform.environment;
+    final server = env['MSSQL_SERVER'];
+    final address = server == null ? null : Uri.parse('mssql://$server');
     return TestDbConfig(
       ip: env['MSSQL_IP']?.trim().isNotEmpty == true
           ? env['MSSQL_IP']!.trim()
-          : '127.0.0.1',
-      port: int.tryParse(env['MSSQL_PORT'] ?? '') ?? 1433,
+          : address?.host ?? '',
+      port:
+          int.tryParse(env['MSSQL_PORT'] ?? '') ??
+          (address?.hasPort == true ? address!.port : 1433),
       databaseName: env['MSSQL_DB']?.trim().isNotEmpty == true
           ? env['MSSQL_DB']!.trim()
           : 'master',
       username: env['MSSQL_USER']?.trim() ?? '',
-      password: env['MSSQL_PASSWORD']?.trim() ?? '',
+      password: env['MSSQL_PASSWORD'] ?? env['MSSQL_PASS'] ?? '',
     );
   }
 
   static final TestDbConfig current = TestDbConfig.fromEnv();
+
+  Future<bool> connect(
+    MssqlConnection client, {
+    String? database,
+    String? username,
+    String? password,
+    int timeoutInSeconds = 15,
+    int maxResultRows = 100000,
+    int maxResultBytes = 64 * 1024 * 1024,
+  }) {
+    requireTempDbConfig();
+    final env = Platform.environment;
+    if (env['MSSQL_NATIVE_DIR'] != null) {
+      NativeLoader.libraryDirectory = env['MSSQL_NATIVE_DIR'];
+    }
+    return client.connect(
+      ip: ip,
+      port: '$port',
+      databaseName: database ?? databaseName,
+      username: username ?? this.username,
+      password: password ?? this.password,
+      timeoutInSeconds: timeoutInSeconds,
+      autocommit: true,
+      maxResultRows: maxResultRows,
+      maxResultBytes: maxResultBytes,
+      caFile: env['MSSQL_CA_FILE'] ?? 'system',
+      certificateHostname: env['MSSQL_CERTIFICATE_HOSTNAME'],
+      trustServerCertificate: env['MSSQL_TRUST_SERVER_CERTIFICATE'] == 'true',
+    );
+  }
 }

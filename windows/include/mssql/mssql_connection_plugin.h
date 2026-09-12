@@ -1,5 +1,5 @@
-#ifndef FLUTTER_PLUGIN_MSSQL_CONNECTION_PLUGIN_H_
-#define FLUTTER_PLUGIN_MSSQL_CONNECTION_PLUGIN_H_
+#ifndef FLUTTER_PLUGIN_MSSQL_PLUGIN_H_
+#define FLUTTER_PLUGIN_MSSQL_PLUGIN_H_
 
 #include <flutter/plugin_registrar_windows.h>
 
@@ -20,4 +20,4 @@ FLUTTER_PLUGIN_EXPORT void MssqlConnectionPluginRegisterWithRegistrar(
 }
 #endif
 
-#endif  // FLUTTER_PLUGIN_MSSQL_CONNECTION_PLUGIN_H_
+#endif  // FLUTTER_PLUGIN_MSSQL_PLUGIN_H_

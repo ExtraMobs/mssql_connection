@@ -6,7 +6,9 @@ import 'package:ffi/ffi.dart';
 import 'ffi/freetds_bindings.dart';
 import 'ffi/freetds_text.dart';
 import 'sql_exception.dart';
-import 'sql_response.dart';
+import 'sql_row.dart';
+
+part 'mssql_cursor.dart';
 
 /// One serialized DB-Lib session. Native calls block the owning isolate.
 class MssqlClient {
@@ -17,6 +19,9 @@ class MssqlClient {
   DBLib? _db;
   Pointer<DBPROCESS>? _dbproc;
   Future<void> _tail = Future.value();
+  final _cursors = <MssqlCursor>{};
+  MssqlCursor? _activeCursor;
+  bool _autocommit;
 
   MssqlClient({
     required this.server,
@@ -28,8 +33,12 @@ class MssqlClient {
     this.queryTimeoutSeconds = 30,
     this.maxResultRows = 100000,
     this.maxResultBytes = 64 * 1024 * 1024,
+    bool autocommit = false,
     DBLib? dbLib,
-  }) : _db = dbLib;
+  }) : _db = dbLib,
+       _autocommit = autocommit;
+
+  bool get autocommit => _autocommit;
 
   bool get isConnected => _dbproc != null;
   Future<T> _run<T>(FutureOr<T> Function() action) {
@@ -146,10 +155,11 @@ class MssqlClient {
               db.dbsetopt(_dbproc!, DBSETTIME, text('$queryTimeoutSeconds'), 0),
         );
       });
-      _execute(
+      _command(
         'SET TEXTSIZE 2147483647; SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON; '
         'SET ANSI_PADDING ON; SET ANSI_WARNINGS ON; SET CONCAT_NULL_YIELDS_NULL ON; '
-        'SET ARITHABORT ON; SET NUMERIC_ROUNDABORT OFF;',
+        'SET ARITHABORT ON; SET NUMERIC_ROUNDABORT OFF; '
+        'SET IMPLICIT_TRANSACTIONS ${_autocommit ? 'OFF' : 'ON'};',
       );
       return true;
     } catch (_) {
@@ -161,9 +171,27 @@ class MssqlClient {
   });
 
   Future<void> close() => _run(_close);
+
+  void _commit() => _command('WHILE @@TRANCOUNT > 0 COMMIT TRAN');
+  Future<void> commit() => _run(_commit);
+
+  void _rollback() => _command('IF @@TRANCOUNT > 0 ROLLBACK TRAN');
+  Future<void> rollback() => _run(_rollback);
+
+  Future<void> setAutocommit(bool value) => _run(() {
+    if (!isConnected) throw StateError('Not connected');
+    if (value == _autocommit) return;
+    if (value) _commit();
+    _command('SET IMPLICIT_TRANSACTIONS ${value ? 'OFF' : 'ON'}');
+    _autocommit = value;
+  });
   void _close() {
     final proc = _dbproc;
     _dbproc = null;
+    for (final cursor in _cursors.toList()) {
+      cursor._finish();
+    }
+    _activeCursor = null;
     if (proc != null) {
       try {
         _db!.dbclose(proc);
@@ -190,27 +218,53 @@ class MssqlClient {
     }
   }
 
-  Future<SqlResponse> execute(String sql) => _run(() => _execute(sql));
-  SqlResponse _execute(String sql) {
+  Future<MssqlCursor> execute(String sql, [Object? parameters]) async {
+    final current = cursor();
+    try {
+      return await current.execute(sql, parameters);
+    } catch (_) {
+      await current.close();
+      rethrow;
+    }
+  }
+
+  void _command(String sql, [Object? parameters]) {
+    final current = cursor();
+    try {
+      current._execute(sql, parameters);
+      current._drain();
+    } finally {
+      current._close();
+    }
+  }
+
+  void _sendSql(String sql) {
     if (sql.contains('\u0000')) throw ArgumentError('SQL cannot contain NUL');
-    return _operation(
+    _operation(
       (db, proc) => using((arena) {
         _check(
           'dbcmd',
           () => db.dbcmd(proc, toNativeFreeTdsText(sql, allocator: arena)),
         );
         _check('dbsqlexec', () => db.dbsqlexec(proc));
-        return _collectResults(db, proc);
       }),
     );
   }
 
-  Future<SqlResponse> executeParams(String sql, Map<String, dynamic> params) =>
-      _run(() => _executeParams(sql, params));
-  SqlResponse _executeParams(String sql, Map<String, dynamic> params) {
+  List<(String, dynamic)> _sqlParams(String sql, Object params) {
+    if (params is List) {
+      final bound = _bindPositional(sql, params);
+      sql = bound.$1;
+      params = bound.$2;
+    }
+    if (params is! Map<String, dynamic>) {
+      throw ArgumentError(
+        'Parameters must be a List or a Map<String, dynamic>',
+      );
+    }
     final norm = _normalizeParams(params, limit: 2098);
     // Positional user arguments cannot collide with the built-in @stmt/@params.
-    return _rpc('sp_executesql', [
+    return [
       ('@stmt', sql),
       (
         '@params',
@@ -219,21 +273,10 @@ class MssqlClient {
             .join(', '),
       ),
       for (final value in norm.values) ('', value),
-    ]);
+    ];
   }
 
-  Future<SqlResponse> executeProcedure(
-    String name,
-    Map<String, dynamic> params,
-  ) => _run(
-    () => _rpc(
-      quoteSqlName(name),
-      _normalizeParams(params).entries.map((e) => (e.key, e.value)).toList(),
-    ),
-  );
-  SqlResponse _rpc(String name, List<(String, dynamic)> params) => using((
-    arena,
-  ) {
+  void _sendRpc(String name, List<(String, dynamic)> params) => using((arena) {
     final rpcName = toNativeFreeTdsText(name, allocator: arena);
     // Validate and encode before starting RPC; retain all buffers through send.
     final values = [
@@ -261,18 +304,37 @@ class MssqlClient {
       }
       _check('dbrpcsend', () => db.dbrpcsend(proc));
       _check('dbsqlok', () => db.dbsqlok(proc));
-      return _collectResults(db, proc);
     });
   });
 
-  /// Without a caller transaction, completed INSERTs/BCP batches remain committed
-  /// if a later row fails. Use MssqlConnection.transaction for atomic bulk loads.
-  Future<int> bulkInsert(
+  /// Creates an idle cursor; commands are serialized when executed.
+  MssqlCursor cursor({
+    void Function()? validate,
+    Future<T> Function<T>(FutureOr<T> Function())? schedule,
+    void Function()? validateTransactionControl,
+  }) {
+    final proc = _dbproc;
+    if (proc == null) throw StateError('Not connected. Call connect() first.');
+    final current = MssqlCursor._(
+      this,
+      _db!,
+      proc,
+      validate,
+      schedule,
+      validateTransactionControl,
+    );
+    _cursors.add(current);
+    return current;
+  }
+
+  /// Manual mode uses RPC INSERTs so the connection owns the entire transaction.
+  /// Autocommit may preserve completed rows/batches if a later row fails.
+  int _bulkInsert(
     String tableName,
     List<Map<String, dynamic>> rows, {
     List<String>? columns,
     int batchSize = 1000,
-  }) => _run(() {
+  }) {
     final table = quoteSqlName(tableName);
     if (batchSize <= 0) throw ArgumentError.value(batchSize, 'batchSize');
     if (rows.isEmpty) return 0;
@@ -287,12 +349,23 @@ class MssqlClient {
       }
     }
     final types = [for (final col in cols) _bulkType(rows.map((r) => r[col]))];
-    var useBcp = !table.startsWith('[#') && !types.contains(null);
+    var useBcp =
+        _autocommit && !table.startsWith('[#') && !types.contains(null);
     if (useBcp) {
-      final actual = _execute(
-        'SELECT TOP (0) * FROM $table',
-      ).resultSets.single.columns;
+      final metadata = cursor();
+      late final List<String> actual;
+      try {
+        metadata._execute('SELECT @@TRANCOUNT', null);
+        useBcp = metadata._native(() => metadata._rows.fetchone()!.single) == 0;
+        metadata._drain();
+        metadata._execute('SELECT TOP (0) * FROM $table', null);
+        actual = metadata.columns!;
+        metadata._drain();
+      } finally {
+        metadata._close();
+      }
       useBcp =
+          useBcp &&
           actual.length == cols.length &&
           List.generate(
             cols.length,
@@ -304,7 +377,7 @@ class MssqlClient {
       final sql =
           'INSERT INTO $table ($columnSql) VALUES (${List.generate(cols.length, (i) => '@p$i').join(', ')})';
       for (final row in rows) {
-        _executeParams(sql, {
+        _command(sql, {
           for (var i = 0; i < cols.length; i++) 'p$i': row[cols[i]],
         });
       }
@@ -351,64 +424,72 @@ class MssqlClient {
         return copied;
       }),
     );
-  });
-
-  SqlResponse _collectResults(DBLib db, Pointer<DBPROCESS> proc) {
-    final sets = <SqlResultSet>[];
-    var affected = 0, rowCount = 0, bytes = 0;
-    while (true) {
-      final result = _checked(
-        'dbresults',
-        () => db.dbresults(proc),
-        (rc) => rc == SUCCEED || rc == NO_MORE_RESULTS,
-      );
-      if (result == NO_MORE_RESULTS) break;
-      final count = db.dbnumcols(proc);
-      if (count < 0) throw SQLException('Invalid column count');
-      final types = [for (var i = 1; i <= count; i++) db.dbcoltype(proc, i)];
-      final columns = [
-        for (var i = 1; i <= count; i++)
-          fromNativeFreeTdsText(db.dbcolname(proc, i)),
-      ];
-      final rows = <List<dynamic>>[];
-      if (count > 0) {
-        while (true) {
-          final next = _checked(
-            'dbnextrow',
-            () => db.dbnextrow(proc),
-            (rc) => rc == REG_ROW || rc == NO_MORE_ROWS,
-          );
-          if (next == NO_MORE_ROWS) break;
-          if (++rowCount > maxResultRows) {
-            throw SQLException('Result row limit exceeded');
-          }
-          final row = <dynamic>[];
-          for (var i = 1; i <= count; i++) {
-            final len = db.dbdatlen(proc, i);
-            if (len < 0) throw SQLException('Invalid column length');
-            bytes += len;
-            if (bytes > maxResultBytes) {
-              throw SQLException('Result byte limit exceeded');
-            }
-            row.add(
-              decodeDbValueWithFallback(
-                db,
-                proc,
-                types[i - 1],
-                db.dbdata(proc, i),
-                len,
-              ),
-            );
-          }
-          rows.add(row);
-        }
-        sets.add(SqlResultSet(columns: columns, rows: rows));
-      }
-      final countAffected = db.dbcount(proc);
-      if (countAffected > 0) affected += countAffected;
-    }
-    return SqlResponse(resultSets: sets, totalAffectedRows: affected);
   }
+}
+
+(String, Map<String, dynamic>) _bindPositional(String sql, List values) {
+  var prefix = '@__cursor';
+  final lower = sql.toLowerCase();
+  while (lower.contains(prefix)) {
+    prefix += '_';
+  }
+  final output = StringBuffer();
+  final parameters = <String, dynamic>{};
+  var i = 0;
+  while (i < sql.length) {
+    final ch = sql[i];
+    if (ch == "'" || ch == '"' || ch == '[') {
+      final end = ch == '[' ? ']' : ch;
+      output.write(ch);
+      i++;
+      while (i < sql.length) {
+        final quoted = sql[i++];
+        output.write(quoted);
+        if (quoted == end) {
+          if (i < sql.length && sql[i] == end) {
+            output.write(sql[i++]);
+          } else {
+            break;
+          }
+        }
+      }
+    } else if (sql.startsWith('--', i)) {
+      while (i < sql.length && sql[i] != '\n' && sql[i] != '\r') {
+        output.write(sql[i++]);
+      }
+    } else if (sql.startsWith('/*', i)) {
+      var depth = 1;
+      output.write('/*');
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql.startsWith('/*', i)) {
+          depth++;
+          output.write('/*');
+          i += 2;
+        } else if (sql.startsWith('*/', i)) {
+          depth--;
+          output.write('*/');
+          i += 2;
+        } else {
+          output.write(sql[i++]);
+        }
+      }
+    } else if (ch == '?') {
+      final index = parameters.length;
+      if (index >= values.length) throw ArgumentError('Too few SQL parameters');
+      final name = '${prefix}_$index';
+      parameters[name] = values[index];
+      output.write(name);
+      i++;
+    } else {
+      output.write(ch);
+      i++;
+    }
+  }
+  if (parameters.length != values.length) {
+    throw ArgumentError('Too many SQL parameters');
+  }
+  return (output.toString(), parameters);
 }
 
 (String, int)? _splitHostPort(String server) {
